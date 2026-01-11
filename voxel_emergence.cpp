@@ -98,11 +98,10 @@ static inline float hash_to_f11(uint64_t x) {
 struct Params {
     int nx=64, ny=64, nz=8;
 
-    float E_max = 10.0f;
     float E_global_leak = 0.01f;
     float E_route_loss  = 0.10f;
 
-    float D_max = 10.0f;
+    float D_ref = 10.0f;
     float D_activity_gain = 0.02f;
     float D_counterflow_gain = 0.01f;
     float D_slow_anneal = 0.00005f; // 0 no effect, 0.0005 melts
@@ -133,7 +132,7 @@ struct Params {
     int cut_axis = 1;                    // 0=X, 1=Y, 2=Z
     float cut_frac = 0.5f;              // where the plane is (0..1)
     float cut_thickness = 15.0f;          // in voxels
-    float cut_damage = 0.8f;             // fraction of D_max
+    float cut_damage = 0.8f;             // fraction of D_ref
 
     float sent_tail_rise  = 0.20f;  
     float sent_tail_decay = 0.995f; 
@@ -172,7 +171,7 @@ struct Params {
     float act_k      = 5.0f;  // sharp but not binary
 
 
-    float R_health_D = 0.6f;    // "healthy" threshold in D/D_max space
+    float R_health_D = 0.6f;    // "healthy" threshold in D/D_ref space
     float R_flux_gate_q = 0.99f; // use sent quantiles gate (q=0.95/0.99)
     float R_gate_min = 0.05f;    // additional gate: minimum g(...) when conversion allowed
     float R_spend_k = 0.01f;     // spend rate per unit repair amount
@@ -730,7 +729,7 @@ struct World {
     }
 
     inline float conductivity(float D) const {
-        float x = clampf(D / p.D_max, 0.0f, 1.0f);
+        float x = clampf(D / p.D_ref, 0.0f, 1.0f);
         constexpr float x_crit = 0.6f;
         float sharpness = p.D_to_conduct_drop;
         float cliff = 1.0f / (1.0f + std::exp(sharpness * (x - x_crit)));
@@ -836,7 +835,7 @@ struct World {
             R_boost[i] *= p.repair_boost_decay;
             if (R_boost[i] < 1e-6f) R_boost[i] = 0.0f;
             // slow relaxation toward baseline
-            float d = clampf(curr.D[i] / p.D_max, 0.0f, 1.0f);
+            float d = clampf(curr.D[i] / p.D_ref, 0.0f, 1.0f);
 
             // more damage → faster P replenishment
             float alpha_eff = p.P_alpha * (1.0f + p.P_damage_gain * d);
@@ -861,7 +860,7 @@ struct World {
                     for (int x = 0; x < p.nx; x++) {
                         if (!in_cut_region(x,y,z)) continue;
                         size_t i = (size_t)idx(x,y,z);
-                        next.E[i] += p.cut_damage * p.D_max;
+                        next.E[i] += p.cut_damage * p.D_ref;
                     }
                 }
             }
@@ -887,8 +886,8 @@ struct World {
         }
 
         for (size_t i=0; i<nvox; i++) {
-            next.E[i] = clampf(next.E[i], 0.0f, p.E_max);
-            next.D[i] = clampf(next.D[i], 0.0f, p.D_max);
+            next.E[i] = clampf(next.E[i], 0.0f, 10000);
+            next.D[i] = clampf(next.D[i], 0.0f, 10000);
         }
 
         std::swap(curr.E, next.E);
@@ -941,7 +940,7 @@ struct World {
         const float loss = (1.0f - p.E_route_loss);
 
         for (size_t i = 0; i < nvox; i++) {
-            float x = clampf(curr.D[i] / p.D_max, 0.0f, 1.0f);
+            float x = clampf(curr.D[i] / p.D_ref, 0.0f, 1.0f);
             float eff_leak = p.E_global_leak * (1.0f + p.leak_k * x * x);
             eff_leak = clampf(eff_leak, 0.0f, 1.0f);
 
@@ -1129,7 +1128,7 @@ struct World {
             auto try_repair_from = [&](int j) {
                 if (j < 0) { g_jneg++; return; }
 
-                float xj = curr.D[(size_t)j] / p.D_max;
+                float xj = curr.D[(size_t)j] / p.D_ref;
                 if (xj > p.repairer_dead_thresh) { g_dead++; return; }
                 eligible_repairers++;
 
@@ -1243,7 +1242,7 @@ struct World {
     void evolve_weights_curr_to_next() {
         for (size_t i = 0; i < nvox; i++) {
             float D = curr.D[i];
-            float x = D / p.D_max;
+            float x = D / p.D_ref;
             if (x < 0.0f) x = 0.0f;
             if (x > 1.0f) x = 1.0f;
 
@@ -1505,7 +1504,7 @@ std::cout << "DBG tick="<<tick<<" Emax="<<Emax_local<<" Smax="<<Smax
             << " E_max=" << Emax
             << " VarE=" << VarE
             << " D_sum=" << Ds
-            << " D_max=" << Dmax
+            << " D_ref=" << Dmax
             << " VarD=" << VarD
             //<< " D_q50=" << D_q50
             << " D_q95=" << D_q95
