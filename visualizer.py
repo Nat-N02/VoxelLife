@@ -82,6 +82,8 @@ def visualize_time_slices(start_idx=1, step=1):
 
         if state["lock_scale"] and state["field"] in ("E", "D"):
             img.set_clim(0.0, 10.0)
+        elif state["field"] in ("R_boost"):
+            img.set_clim(0.0, 1.0)
         else:
             img.autoscale()
 
