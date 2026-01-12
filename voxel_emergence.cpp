@@ -97,7 +97,7 @@ static inline float hash_to_f11(uint64_t x) {
 // Params
 // ============================================================
 struct Params {
-    int nx=128, ny=128, nz=4;
+    int nx=128, ny=128, nz=3;
 
     float E_global_leak = 0.01f;
     float E_route_loss  = 0.10f;
@@ -121,7 +121,7 @@ struct Params {
     float porous_noise_boost = 0.5f;
 
     float repair_boost_decay = 0.9995f;
-    float repair_boost_max   = 0.8f;
+    float repair_boost_max   = 100.0f;
 
     float repair_surface_k = 0.3f;       // strength of surface penalty
     float repair_surface_power = 1.0f;   // 1 = linear, 2 = harsh
@@ -141,9 +141,9 @@ struct Params {
     float repair_tail_frac = 0.75f;       // IMPORTANT: 0.6-0.7 blob range
     int sent_tail_radius = 10;  // try 1, 2, or 3
 
-    float repair_hysteresis_tau = 100.0f;  
-    float repair_trigger_activity = 0.10f;
-    float random_unpin_prob = 0.0f;
+    float repair_hysteresis_tau = 0.0f;  // USELESS
+    float repair_trigger_activity = 0.0f; // USELESS
+    float random_unpin_prob = 1e-6f; // USELESS
 
     float source_inject = 0.05f;
 
@@ -151,12 +151,12 @@ struct Params {
     float repair_activity_thresh = 1.6;  
     float repair_cost_activity_k = 0.0f;  
     float repair_cost_super_k = 20.0f;   
-    float repairer_dead_thresh = 0.6f;   
+    float repairer_dead_thresh = 100.6f;   // useless
     float repairer_eff_power = 2.0f;     
 
-    float source_noise_sigma = 0.00f;   
-    float source_noise_tau   = 100000.0f; // 10k shrinks, seems to come back: explore more
-    float source_spatial_k   = 0.01f;     // noise shape change
+    float source_noise_sigma = 0.00f;     // useless
+    float source_noise_tau   = 100000.0f; // useless
+    float source_spatial_k   = 0.01f;     // useless
 
     // --- Precursor -> R_boost ---
     float P0 = 1.0f;            // baseline precursor level
@@ -737,10 +737,10 @@ struct World {
         float ybest = (wyp > wyn) ? wyp : wyn;
         float zbest = (wzp > wzn) ? wzp : wzn;
 
-        if (xbest <= ybest && xbest <= zbest) {
+        if (xbest >= ybest && xbest >= zbest) {
             Dir f = (wxp >= wxn) ? XP : XN;
             return {f, opposite(f), XP};
-        } else if (ybest <= xbest && ybest <= zbest) {
+        } else if (ybest >= xbest && ybest >= zbest) {
             Dir f = (wyp >= wyn) ? YP : YN;
             return {f, opposite(f), YP};
         } else {
@@ -794,7 +794,7 @@ struct World {
     // --------------------------------------------------------
     inline bool is_source_voxel(int x,int y,int z) const {
         (void)x; (void)y;
-        return (z == 0);
+        return (z == 0 || z == 2);
     }
 
     // --------------------------------------------------------
@@ -844,8 +844,6 @@ struct World {
         for (size_t i = 0; i < nvox; i++) {
             // copy state
             next.D[i] = curr.D[i];
-            for (int d = 0; d < 6; d++)
-                next.W[i*6 + d] = 0;
             next.P[i] = curr.P[i];
             // IMPORTANT: next.E is a pure accumulator
             next.E[i] = 0.0f;
@@ -1166,8 +1164,8 @@ struct World {
                 vh[i] ^ (tick * MIX_TICK) ^ 0xA53C9E1FULL
             ) + 1.0f);
 
-            if (u01 < p.random_unpin_prob) {
-                next.D[i] *= 0.1f;  // or neighborhood mean, etc.
+            if (u01 < p.random_unpin_prob && next.D[i] < 2) {
+                next.D[i] += 3.0f; 
             }
 
         }
@@ -1274,7 +1272,6 @@ struct World {
                 // elig=0.5 -> thresh*2
                 // elig=0   -> thresh*3 (and you can also early-return at elig==0)
 
-                if (elig <= 0.0f) return;
                 if (sent[(size_t)j] < eff_thresh) return;
 
                 eligible_active_repairers++;
@@ -1325,9 +1322,6 @@ struct World {
 
                 float R_spend = p.R_spend_k * amount;
                 R_boost[i] = std::max(0.0f, R_boost[i] - R_spend);
-
-                // after determining `amount` (actual applied repair)
-                if (R_boost[i] > p.repair_boost_max) R_boost[i] = p.repair_boost_max;
 
 
                 repair_delta[i] += amount;
