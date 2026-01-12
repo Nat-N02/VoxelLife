@@ -128,18 +128,18 @@ struct Params {
 
     // --- blob splitting (damage wall) ---
     bool enable_cut = false;
-    int cut_start_tick = 5000;
-    int cut_end_tick   = 10000;          // duration ~5000 ticks
+    int cut_start_tick = 10000;
+    int cut_end_tick   = 12000;          // duration ~5000 ticks
     int cut_axis = 1;                    // 0=X, 1=Y, 2=Z
     float cut_frac = 0.5f;              // where the plane is (0..1)
-    float cut_thickness = 15.0f;          // in voxels
+    float cut_thickness = 10.0f;          // in voxels
     float cut_damage = 0.8f;             // fraction of D_ref
 
     float sent_tail_rise  = 0.20f;  
     float sent_tail_decay = 0.995f; 
     float enable_repair_gradient = false;
-    float repair_tail_frac = 0.6f;       // IMPORTANT: 0.6-0.7 blob range
-    int sent_tail_radius = 20;  // try 1, 2, or 3
+    float repair_tail_frac = 0.75f;       // IMPORTANT: 0.6-0.7 blob range
+    int sent_tail_radius = 10;  // try 1, 2, or 3
 
     float repair_hysteresis_tau = 100.0f;  
     float repair_trigger_activity = 0.10f;
@@ -737,10 +737,10 @@ struct World {
         float ybest = (wyp > wyn) ? wyp : wyn;
         float zbest = (wzp > wzn) ? wzp : wzn;
 
-        if (xbest >= ybest && xbest >= zbest) {
+        if (xbest <= ybest && xbest <= zbest) {
             Dir f = (wxp >= wxn) ? XP : XN;
             return {f, opposite(f), XP};
-        } else if (ybest >= xbest && ybest >= zbest) {
+        } else if (ybest <= xbest && ybest <= zbest) {
             Dir f = (wyp >= wyn) ? YP : YN;
             return {f, opposite(f), YP};
         } else {
@@ -845,7 +845,7 @@ struct World {
             // copy state
             next.D[i] = curr.D[i];
             for (int d = 0; d < 6; d++)
-                next.W[i*6 + d] = curr.W[i*6 + d];
+                next.W[i*6 + d] = 0;
             next.P[i] = curr.P[i];
             // IMPORTANT: next.E is a pure accumulator
             next.E[i] = 0.0f;
@@ -990,7 +990,7 @@ struct World {
             const float* w = &curr.W[i*6];
             for (int d = 0; d < 6; d++) {
                 float frac = w[d];
-                sent_dir[i*6 + d] = send * frac;
+                sent_dir[i*6 + d] = send / 6;
 
                 int j = nbr[i*6 + d];
                 if (j >= 0) next.E[(size_t)j] += delivered * frac;
@@ -1405,13 +1405,14 @@ struct World {
             }
         }
         // Core + variance
-        double Es=0.0, Ds=0.0, E2=0.0, D2=0.0;
+        double Es=0.0, Ds=0.0, E2=0.0, D2=0.0, Rs=0.0;
         float Emax=0.0f, Dmax=0.0f;
 
         for (size_t i=0; i<nvox; i++) {
             float e = curr.E[i];
             float d = curr.D[i];
-            Es += e; Ds += d;
+            float r = R_boost[i];
+            Es += e; Ds += d; Rs += r;
             E2 += double(e) * double(e);
             D2 += double(d) * double(d);
             if (e > Emax) Emax = e;
@@ -1605,13 +1606,13 @@ struct World {
         double EMU = fossil_frozen ? compute_EMU(curr.D, fossil_C, repaired_flag, D_q50, nvox): 0.0;
 
         float Smax = 0, Dmax_local = 0, Pmax = 0, Rmax = 0, Emax_local = 0;
-for (size_t i=0; i<nvox; i++) {
-    Smax = std::max(Smax, sent[i]);
-    Dmax_local = std::max(Dmax_local, curr.D[i]);
-    Pmax = std::max(Pmax, curr.P[i]);
-    Rmax = std::max(Rmax, R_boost[i]);
-    Emax_local = std::max(Emax_local, curr.E[i]);
-}
+        for (size_t i=0; i<nvox; i++) {
+            Smax = std::max(Smax, sent[i]);
+            Dmax_local = std::max(Dmax_local, curr.D[i]);
+            Pmax = std::max(Pmax, curr.P[i]);
+            Rmax = std::max(Rmax, R_boost[i]);
+            Emax_local = std::max(Emax_local, curr.E[i]);
+        }
 std::cout << "DBG tick="<<tick<<" Emax="<<Emax_local<<" Smax="<<Smax
           <<" Dmax="<<Dmax_local<<" Pmax="<<Pmax<<" Rmax="<<Rmax<<"\n";
 
@@ -1622,6 +1623,7 @@ std::cout << "DBG tick="<<tick<<" Emax="<<Emax_local<<" Smax="<<Smax
             << " VarE=" << VarE
             << " D_sum=" << Ds
             << " D_ref=" << Dmax
+            << " R_sum=" << Rs
             << " VarD=" << VarD
             //<< " D_q50=" << D_q50
             << " D_q95=" << D_q95
