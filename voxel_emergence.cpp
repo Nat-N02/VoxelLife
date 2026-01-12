@@ -21,6 +21,7 @@
 #include <chrono>
 #include <string>
 #include <fstream>
+#include <functional>
 
 // ============================================================
 // Utility
@@ -96,7 +97,7 @@ static inline float hash_to_f11(uint64_t x) {
 // Params
 // ============================================================
 struct Params {
-    int nx=64, ny=64, nz=8;
+    int nx=128, ny=128, nz=4;
 
     float E_global_leak = 0.01f;
     float E_route_loss  = 0.10f;
@@ -138,6 +139,7 @@ struct Params {
     float sent_tail_decay = 0.995f; 
     float enable_repair_gradient = false;
     float repair_tail_frac = 0.6f;       // IMPORTANT: 0.6-0.7 blob range
+    int sent_tail_radius = 20;  // try 1, 2, or 3
 
     float repair_hysteresis_tau = 100.0f;  
     float repair_trigger_activity = 0.10f;
@@ -219,7 +221,9 @@ struct World {
     std::vector<float> source_bias;   // additive energy bias per voxel
     std::vector<float> source_phase;  // slow phase accumulator
     std::vector<float> source_applied;
-    
+    std::vector<float> sent_tail_local;  // size nvox
+    std::vector<float> tmpX, tmpY;        // scratch for separable max-filter
+
     std::vector<uint8_t> top1_prev, top5_prev, top10_prev;
     bool have_top_prev = false;
 
@@ -277,6 +281,9 @@ struct World {
         source_bias.assign(nvox, 0.0f);
         source_phase.assign(nvox, 0.0f);
         source_applied.assign(nvox, 0.0f);
+        sent_tail_local.assign(nvox, 1e-6f);    
+        tmpX.assign(nvox, 0.0f);
+        tmpY.assign(nvox, 0.0f);
 
         D_prev_tick.assign(nvox, 0.0f);
 
@@ -529,17 +536,31 @@ struct World {
     }
 
     inline float repair_tail_frac_at_x(int x) const {
-        if (!p.enable_repair_gradient) {
-            return p.repair_tail_frac;
+            if (!p.enable_repair_gradient) {
+                return p.repair_tail_frac;
+            }
+            int w = p.nx / 4;
+
+            if (x < w)          return 0.6f;
+            else if (x < 2*w)   return 0.6f;
+            else if (x < 3*w)   return 0.6f;
+            else                return 0.6f;
         }
-        int w = p.nx / 4;
 
-        if (x < w)          return 0.6f;
-        else if (x < 2*w)   return 0.6f;
-        else if (x < 3*w)   return 0.6f;
-        else                return 0.6f;
+        inline void for_each_neighbor_radius(
+        int x0, int y0, int z0, int R,
+        const std::function<void(int,int,int,size_t)>& f
+    ) const {
+        for (int dz = -R; dz <= R; dz++)
+        for (int dy = -R; dy <= R; dy++)
+        for (int dx = -R; dx <= R; dx++) {
+            if (std::abs(dx) + std::abs(dy) + std::abs(dz) > R) continue;
+            int x = x0 + dx, y = y0 + dy, z = z0 + dz;
+            if (x<0||x>=p.nx||y<0||y>=p.ny||z<0||z>=p.nz) continue;
+            size_t j = idx(x,y,z);
+            f(x,y,z,j);
+        }
     }
-
 
     void dump_fields() const {
         char fname[256];
@@ -977,23 +998,119 @@ struct World {
         }
     }
 
+    static inline void sliding_max_1d_padded(
+        const float* in, int L, int r, float* out
+    ) {
+        if (r <= 0) {
+            std::copy(in, in + L, out);
+            return;
+        }
+
+        const int w = 2*r + 1;
+        const int T = L + 2*r;          // padded length
+        const float NEG_INF = -1e30f;
+
+        std::vector<int> dq;
+        dq.reserve(w);
+
+        auto get = [&](int t)->float {
+            // padded index t maps to original index k=t-r
+            int k = t - r;
+            if (k < 0 || k >= L) return NEG_INF;
+            return in[k];
+        };
+
+        int head = 0; // index into dq (manual pop_front without O(n))
+
+        for (int t = 0; t < T; t++) {
+            float v = get(t);
+
+            // pop_back while last value <= v
+            while ((int)dq.size() > head) {
+                int back_idx = dq.back();
+                if (get(back_idx) > v) break;
+                dq.pop_back();
+            }
+            dq.push_back(t);
+
+            // pop_front if out of window [t-w+1, t]
+            int win_lo = t - w + 1;
+            while ((int)dq.size() > head && dq[head] < win_lo) head++;
+
+            // output when window fully formed: corresponds to center i = t - 2r
+            int i = t - 2*r;
+            if (i >= 0 && i < L) {
+                out[i] = get(dq[head]);
+            }
+
+            // occasionally compact to avoid dq growing forever
+            if (head > 1024) {
+                dq.erase(dq.begin(), dq.begin() + head);
+                head = 0;
+            }
+        }
+    }
+
+    void compute_sent_local_max_box(int r, std::vector<float>& out_local_max) {
+        out_local_max.assign(nvox, 0.0f);
+
+        // Shortcut: if radius covers entire grid, local max == global max everywhere
+        int Rneed = std::max({p.nx-1, p.ny-1, p.nz-1});
+        if (r >= Rneed) {
+            float gmax = 0.0f;
+            for (size_t i=0; i<nvox; i++) gmax = std::max(gmax, sent[i]);
+            std::fill(out_local_max.begin(), out_local_max.end(), gmax);
+            return;
+        }
+
+        // Pass 1: X lines
+        for (int z=0; z<p.nz; z++) {
+            for (int y=0; y<p.ny; y++) {
+                const float* line = &sent[(z*p.ny + y)*p.nx];
+                float* out = &tmpX[(z*p.ny + y)*p.nx];
+                sliding_max_1d_padded(line, p.nx, r, out);
+            }
+        }
+
+        // Pass 2: Y lines
+        std::vector<float> inY(p.ny), outY(p.ny);
+        for (int z=0; z<p.nz; z++) {
+            for (int x=0; x<p.nx; x++) {
+                // gather line along y
+                for (int y=0; y<p.ny; y++) inY[y] = tmpX[idx(x,y,z)];
+                sliding_max_1d_padded(inY.data(), p.ny, r, outY.data());
+                for (int y=0; y<p.ny; y++) tmpY[idx(x,y,z)] = outY[y];
+            }
+        }
+
+        // Pass 3: Z lines
+        std::vector<float> inZ(p.nz), outZ(p.nz);
+        for (int y=0; y<p.ny; y++) {
+            for (int x=0; x<p.nx; x++) {
+                for (int z=0; z<p.nz; z++) inZ[z] = tmpY[idx(x,y,z)];
+                sliding_max_1d_padded(inZ.data(), p.nz, r, outZ.data());
+                for (int z=0; z<p.nz; z++) out_local_max[idx(x,y,z)] = outZ[z];
+            }
+        }
+    }
+
     void update_sent_tail() {
-        float local_max = 0.0f;
-        for (size_t i = 0; i < nvox; i++) {
-            local_max = std::max(local_max, sent[i]);
-        }
+        static std::vector<float> local_max; // reuse
+        int radius = p.sent_tail_radius;
+        compute_sent_local_max_box(radius, local_max);
 
-        // Rise quickly toward new extremes
-        if (local_max > sent_tail) {
-            sent_tail = sent_tail + p.sent_tail_rise * (local_max - sent_tail);
-        } else {
-            // Decay slowly otherwise
-            sent_tail *= p.sent_tail_decay;
-        }
+        for (size_t i=0; i<nvox; i++) {
+            float lm = local_max[i];
+            float& tail = sent_tail_local[i];
 
-        // Hard floor to avoid zero-lock
-        if (sent_tail < 1e-6f)
-            sent_tail = 1e-6f;
+            if (lm > tail) {
+                tail = tail + p.sent_tail_rise * (lm - tail);
+            } else {
+                tail *= p.sent_tail_decay;
+            }
+
+            if (tail < 1e-6f) tail = 1e-6f;
+        }
     }
 
 
@@ -1148,7 +1265,7 @@ struct World {
                 // if elig==0, impossible; if elig==1, normal threshold; if elig small, much harder
                 int x = int(i % p.nx);
                 float tail_frac = repair_tail_frac_at_x(x);
-                float threshold = tail_frac * sent_tail;
+                float threshold = tail_frac * sent_tail_local[i];
                 float eff_thresh = threshold * (1.0f + 2.0f*(1.0f - elig)); 
 
                 float Dgate = curr.D[i] / (curr.D[i] + 1e-2f); // ~0 when D small, ~1 when D big
