@@ -104,7 +104,7 @@ struct Params {
     float D_ref = 10.0f;
     float D_activity_gain = 0.02f;
     float D_counterflow_gain = 0.01f;
-    float D_slow_anneal = 0.00005f; // 0 no effect, 0.0005 melts
+    float D_slow_anneal = 0.00015f; // 0 no effect, 0.0005 melts
 
     float D_to_conduct_drop = 0.3704f; // 0 seems to do nothing? 100 makes some odd crystal thing
     float D_to_noise = 0.03f;
@@ -868,11 +868,11 @@ struct World {
         apply_perpendicular_repair();
         evolve_weights_curr_to_next();
 
-        // anneal + sources + clamp
-        const float anneal = (1.0f - p.D_slow_anneal);
-
-        for (size_t i=0; i<nvox; i++) next.D[i] *= anneal;
-
+        for (size_t i=0; i<nvox; i++) {
+            float activity = sent[i] + repair_delta[i];
+            float k_eff = p.D_slow_anneal * (1 - 0.001f * activity);
+            next.D[i] *= (1-k_eff);
+        }
         for (int z=0; z<p.nz; z++) {
             for (int y=0; y<p.ny; y++) {
                 for (int x=0; x<p.nx; x++) {
