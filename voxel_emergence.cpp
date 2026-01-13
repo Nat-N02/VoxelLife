@@ -97,7 +97,7 @@ static inline float hash_to_f11(uint64_t x) {
 // Params
 // ============================================================
 struct Params {
-    int nx=128, ny=128, nz=3;
+    int nx=64, ny=64, nz=8;
 
     float E_global_leak = 0.01f;
     float E_route_loss  = 0.10f;
@@ -794,7 +794,7 @@ struct World {
     // --------------------------------------------------------
     inline bool is_source_voxel(int x,int y,int z) const {
         (void)x; (void)y;
-        return (z == 0 || z == 2);
+        return ((z % 2) == 1);
     }
 
     // --------------------------------------------------------
@@ -897,9 +897,7 @@ struct World {
                 for (int x=0; x<p.nx; x++) {
                     if (!is_source_voxel(x,y,z)) continue;
                     size_t i = (size_t)idx(x,y,z);
-                    source_applied[i] = lerpf(source_applied[i], source_bias[i], 1e-3);
-                    next.E[i] += std::max(0.0f, source_applied[i]) + p.source_inject;
-
+                    next.E[i] += p.source_inject;
                 }
             }
         }
