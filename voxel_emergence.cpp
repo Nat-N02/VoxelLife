@@ -97,7 +97,7 @@ static inline float hash_to_f11(uint64_t x) {
 // Params
 // ============================================================
 struct Params {
-    int nx=64, ny=64, nz=8;
+    int nx=128, ny=128, nz=4;
 
     float E_global_leak = 0.01f;
     float E_route_loss  = 0.10f;
@@ -121,7 +121,6 @@ struct Params {
     float porous_noise_boost = 0.5f;
 
     float repair_boost_decay = 0.9995f;
-    float repair_boost_max   = 100.0f;
 
     float repair_surface_k = 0.3f;       // strength of surface penalty
     float repair_surface_power = 1.0f;   // 1 = linear, 2 = harsh
@@ -138,12 +137,12 @@ struct Params {
     float sent_tail_rise  = 0.20f;  
     float sent_tail_decay = 0.995f; 
     float enable_repair_gradient = false;
-    float repair_tail_frac = 0.75f;       // IMPORTANT: 0.6-0.7 blob range
-    int sent_tail_radius = 10;  // try 1, 2, or 3
+    float repair_tail_frac = 0.82f;       // IMPORTANT: 0.6-0.7 blob range
+    int sent_tail_radius = 4;
 
     float repair_hysteresis_tau = 0.0f;  // USELESS
     float repair_trigger_activity = 0.0f; // USELESS
-    float random_unpin_prob = 1e-6f; // USELESS
+    float random_unpin_prob = 0.0f; // USELESS
 
     float source_inject = 0.05f;
 
@@ -151,7 +150,6 @@ struct Params {
     float repair_activity_thresh = 1.6;  
     float repair_cost_activity_k = 0.0f;  
     float repair_cost_super_k = 20.0f;   
-    float repairer_dead_thresh = 100.6f;   // useless
     float repairer_eff_power = 2.0f;     
 
     float source_noise_sigma = 0.00f;     // useless
@@ -794,7 +792,7 @@ struct World {
     // --------------------------------------------------------
     inline bool is_source_voxel(int x,int y,int z) const {
         (void)x; (void)y;
-        return ((z % 2) == 1);
+        return (z == 0 || z == 2);
     }
 
     // --------------------------------------------------------
@@ -1240,9 +1238,6 @@ struct World {
 
             auto try_repair_from = [&](int j) {
                 if (j < 0) { g_jneg++; return; }
-
-                float xj = curr.D[(size_t)j] / p.D_ref;
-                if (xj > p.repairer_dead_thresh) { g_dead++; return; }
                 eligible_repairers++;
 
                 float aj = sent[(size_t)j];
@@ -1604,9 +1599,7 @@ struct World {
             Pmax = std::max(Pmax, curr.P[i]);
             Rmax = std::max(Rmax, R_boost[i]);
             Emax_local = std::max(Emax_local, curr.E[i]);
-        }
-std::cout << "DBG tick="<<tick<<" Emax="<<Emax_local<<" Smax="<<Smax
-          <<" Dmax="<<Dmax_local<<" Pmax="<<Pmax<<" Rmax="<<Rmax<<"\n";
+        };
 
         std::cout
             << "tick=" << tick
@@ -1616,6 +1609,8 @@ std::cout << "DBG tick="<<tick<<" Emax="<<Emax_local<<" Smax="<<Smax
             << " D_sum=" << Ds
             << " D_ref=" << Dmax
             << " R_sum=" << Rs
+            << " Rmax=" << Rmax
+            << " Smax=" << Smax
             << " VarD=" << VarD
             //<< " D_q50=" << D_q50
             << " D_q95=" << D_q95
@@ -1634,7 +1629,7 @@ std::cout << "DBG tick="<<tick<<" Emax="<<Emax_local<<" Smax="<<Smax
             << " flux/storage=" << flux_to_storage
             << " repair_events=" << repair_events_tick
             << " repair_eligible_frac=" << (double(repair_eligible_tick) / n)
-            //< " junction_density=" << junction_density
+            //<< " junction_density=" << junction_density
             //<< " rhoD=" << rho_D
             << " rhoD_s=" << rhoD_spearman
             << " BSI=" << BSI
@@ -1657,7 +1652,7 @@ int main(int argc, char** argv) {
     Params p;
 
     int steps = 200000000;
-    uint64_t seed = 10ull;
+    uint64_t seed = 15ull;
     std::cout << "BINARY BUILD ID: "
           << __DATE__ << " " << __TIME__
           << " | seed=" << seed
