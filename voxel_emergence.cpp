@@ -123,12 +123,12 @@ struct Params {
     float repair_boost_decay = 0.9995f;
 
     float repair_surface_k = 0.3f;       // strength of surface penalty
-    float repair_surface_power = 1.0f;   // 1 = linear, 2 = harsh
+    float repair_surface_power = 1.2f;   // 1 = linear, 2 = harsh
 
     // --- blob splitting (damage wall) ---
     bool enable_cut = false;
-    int cut_start_tick = 10000;
-    int cut_end_tick   = 12000;          // duration ~5000 ticks
+    int cut_start_tick = 16000;
+    int cut_end_tick   = 17000;          // duration ~5000 ticks
     int cut_axis = 1;                    // 0=X, 1=Y, 2=Z
     float cut_frac = 0.5f;              // where the plane is (0..1)
     float cut_thickness = 10.0f;          // in voxels
@@ -137,8 +137,8 @@ struct Params {
     float sent_tail_rise  = 0.20f;  
     float sent_tail_decay = 0.995f; 
     float enable_repair_gradient = false;
-    float repair_tail_frac = 0.72f;       // IMPORTANT: 0.6-0.7 blob range
-    int sent_tail_radius = 10;
+    float repair_tail_frac = 0.75f;       // IMPORTANT: 0.6-0.7 blob range
+    int sent_tail_radius = 8;
 
     float repair_hysteresis_tau = 0.0f;  // USELESS
     float repair_trigger_activity = 0.0f; // USELESS
@@ -147,10 +147,8 @@ struct Params {
     float source_inject = 0.05f;
 
     float leak_k = 8.0f; 
-    float repair_activity_thresh = 1.6;  
-    float repair_cost_activity_k = 0.0f;  
+    float repair_cost_activity_k = 1.0f;  
     float repair_cost_super_k = 20.0f;   
-    float repairer_eff_power = 2.0f;     
 
     float source_noise_sigma = 0.00f;     // useless
     float source_noise_tau   = 100000.0f; // useless
@@ -164,15 +162,10 @@ struct Params {
 
     float k_PR = 0.002f;         // conversion rate (k)
     float R_sat = 1.0f;         // saturation scale (RSAT): larger = higher local ceiling
-    float R_decay_healthy = 0.998f;
-    float R_decay_sick    = 0.98f;
 
     float act_thresh = 0.15f;   // needs to be routing ~30% of stored energy
     float act_k      = 5.0f;  // sharp but not binary
 
-    float R_health_D = 0.6f;    // "healthy" threshold in D/D_ref space
-    float R_flux_gate_q = 0.99f; // use sent quantiles gate (q=0.95/0.99)
-    float R_gate_min = 0.05f;    // additional gate: minimum g(...) when conversion allowed
     float R_spend_k = 0.01f;     // spend rate per unit repair amount
 
     // diagnostics
