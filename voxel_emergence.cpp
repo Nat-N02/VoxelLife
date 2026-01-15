@@ -111,7 +111,7 @@ struct Params {
     float D_to_noise = 0.03f;
 
     float W_floor = 1e-4f; // little effect until large scales
-    float W_decay = 0.0005f; // 0.001 seems to expand? 0 inhibits development
+    float W_decay = 0.0f; // 0.001 seems to expand? 0 inhibits development
 
     float repair_strength = 0.05f; // 0.025 inhibits, 0 shrink away to nothing, 0.1 rapid expand
     float repair_energy_cost = 0.05f; // 0 lowers damage and increases size, 0.1 adapts
@@ -790,8 +790,7 @@ struct World {
     // Sources (example: z==0 plane)
     // --------------------------------------------------------
     inline bool is_source_voxel(int x,int y,int z) const {
-        if (z == 0 || z == 2) return ((x+y) % 2 == 1);
-        return false;
+        return (z == 0 || z == 2);
     }
 
     // --------------------------------------------------------
