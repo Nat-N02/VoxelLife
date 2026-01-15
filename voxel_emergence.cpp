@@ -137,19 +137,8 @@ struct Params {
     float sent_tail_rise  = 0.20f;  
     float sent_tail_decay = 0.995f; 
     float enable_repair_gradient = false;
-    float repair_tail_frac = 0.95f;       // IMPORTANT: 0.6-0.7 blob range
-    int sent_tail_radius = 15;
-
-    // --- sent tail mode ---
-    enum SentTailMode : int { TAIL_PERCEPTION = 0, TAIL_SHADOW = 1 };
-    int sent_tail_mode = TAIL_SHADOW;
-
-    // Shadow/broadcast knobs (used only when sent_tail_mode == TAIL_SHADOW)
-    float shadow_emit_gain = 1.0f;      // multiplier on sent before shadowing
-    float shadow_emit_power = 1.5f;     // 1=linear, >1 emphasizes spikes
-    float shadow_min_emit = 0.0f;       // ignore tiny sent
-    bool  shadow_emit_only_sources = false; // optional: only emit from energy-injected voxels
-
+    float repair_tail_frac = 0.75f;       // IMPORTANT: 0.6-0.7 blob range
+    int sent_tail_radius = 8;
 
     float repair_hysteresis_tau = 0.0f;  // USELESS
     float repair_trigger_activity = 0.0f; // USELESS
@@ -224,8 +213,6 @@ struct World {
     std::vector<float> source_applied;
     std::vector<float> sent_tail_local;  // size nvox
     std::vector<float> tmpX, tmpY;        // scratch for separable max-filter
-    std::vector<float> sent_shadow;   // broadcast field (size nvox)
-    std::vector<float> sent_emit;     // emitted strength per voxel (size nvox)
 
     std::vector<uint8_t> top1_prev, top5_prev, top10_prev;
     bool have_top_prev = false;
@@ -287,8 +274,6 @@ struct World {
         sent_tail_local.assign(nvox, 1e-6f);    
         tmpX.assign(nvox, 0.0f);
         tmpY.assign(nvox, 0.0f);
-        sent_shadow.assign(nvox, 0.0f);
-        sent_emit.assign(nvox, 0.0f);
 
         D_prev_tick.assign(nvox, 0.0f);
 
@@ -990,7 +975,8 @@ struct World {
             const float* w = &curr.W[i*6];
             for (int d = 0; d < 6; d++) {
                 float frac = w[d];
-                sent_dir[i*6 + d] = send * frac;
+                sent_dir[i*6 + d] = send / 6;
+
                 int j = nbr[i*6 + d];
                 if (j >= 0) next.E[(size_t)j] += delivered * frac;
             }
@@ -1093,66 +1079,24 @@ struct World {
         }
     }
 
-    void update_sent_tail_perception() {
+    void update_sent_tail() {
         static std::vector<float> local_max; // reuse
         int radius = p.sent_tail_radius;
+        compute_sent_local_max_box(radius, local_max);
 
-        compute_sent_local_max_box(radius, local_max); // local_max[i] = max_j in N(i) sent[j]
-
-        for (size_t i = 0; i < nvox; i++) {
+        for (size_t i=0; i<nvox; i++) {
             float lm = local_max[i];
             float& tail = sent_tail_local[i];
 
-            if (lm > tail) tail = tail + p.sent_tail_rise * (lm - tail);
-            else           tail *= p.sent_tail_decay;
+            if (lm > tail) {
+                tail = tail + p.sent_tail_rise * (lm - tail);
+            } else {
+                tail *= p.sent_tail_decay;
+            }
 
             if (tail < 1e-6f) tail = 1e-6f;
         }
     }
-
-    inline float compute_shadow_emit(size_t i) const {
-        float s = sent[i];
-        if (s <= p.shadow_min_emit) return 0.0f;
-
-        if (p.shadow_emit_only_sources && !is_source_voxel_idx(i))
-            return 0.0f;
-
-        // emphasize spikes if desired
-        float e = (p.shadow_emit_power == 1.0f) ? s : std::pow(s, p.shadow_emit_power);
-        e *= p.shadow_emit_gain;
-        return e;
-    }
-
-    void build_sent_shadow_field() {
-        // sent_emit is the “broadcast” quantity, can differ from sent[]
-        for (size_t i = 0; i < nvox; i++) {
-            sent_emit[i] = compute_shadow_emit(i);
-        }
-
-        // sent_shadow[j] = max_i in N(j) sent_emit[i]
-        compute_sent_local_max_box(p.sent_tail_radius, sent_shadow);
-    }
-
-    void update_sent_tail_shadow() {
-        build_sent_shadow_field();
-
-        for (size_t i = 0; i < nvox; i++) {
-            float lm = sent_shadow[i] - sent[i];
-            
-            float& tail = sent_tail_local[i];
-
-            if (lm > tail) tail = tail + p.sent_tail_rise * (lm - tail);
-            else           tail *= p.sent_tail_decay;
-
-            if (tail < 1e-6f) tail = 1e-6f;
-        }
-    }
-
-    void update_sent_tail() {
-        if (p.sent_tail_mode == Params::TAIL_SHADOW) update_sent_tail_shadow();
-        else                                        update_sent_tail_perception();
-    }
-
 
 
     // --------------------------------------------------------
