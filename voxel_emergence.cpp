@@ -137,8 +137,8 @@ struct Params {
     float sent_tail_rise  = 0.20f;  
     float sent_tail_decay = 0.995f; 
     float enable_repair_gradient = false;
-    float repair_tail_frac = 0.82f;       // IMPORTANT: 0.6-0.7 blob range
-    int sent_tail_radius = 4;
+    float repair_tail_frac = 0.72f;       // IMPORTANT: 0.6-0.7 blob range
+    int sent_tail_radius = 10;
 
     float repair_hysteresis_tau = 0.0f;  // USELESS
     float repair_trigger_activity = 0.0f; // USELESS
@@ -169,7 +169,6 @@ struct Params {
 
     float act_thresh = 0.15f;   // needs to be routing ~30% of stored energy
     float act_k      = 5.0f;  // sharp but not binary
-
 
     float R_health_D = 0.6f;    // "healthy" threshold in D/D_ref space
     float R_flux_gate_q = 0.99f; // use sent quantiles gate (q=0.95/0.99)
@@ -791,8 +790,8 @@ struct World {
     // Sources (example: z==0 plane)
     // --------------------------------------------------------
     inline bool is_source_voxel(int x,int y,int z) const {
-        (void)x; (void)y;
-        return (z == 0 || z == 2);
+        if (z == 0 || z == 2) return ((x+y) % 2 == 1);
+        return false;
     }
 
     // --------------------------------------------------------
