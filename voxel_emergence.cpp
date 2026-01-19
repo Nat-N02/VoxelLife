@@ -100,7 +100,7 @@ struct Params {
     int nx=128, ny=128, nz=4;
 
     float E_global_leak = 0.01f;
-    float E_route_loss  = 0.10f;
+    float E_route_loss  = 0.1f;
 
     float D_ref = 10.0f;
     float D_activity_gain = 0.02f;
@@ -117,7 +117,7 @@ struct Params {
     float repair_energy_cost = 0.05f; // 0 lowers damage and increases size, 0.1 adapts
     float repair_noise = 0.2f; // generally low effect
 
-    float porous_conduct_floor = 0.01f;
+    float porous_conduct_floor = 0.0f;
     float porous_noise_boost = 0.5f;
 
     float repair_boost_decay = 0.9995f;
@@ -136,13 +136,8 @@ struct Params {
 
     float sent_tail_rise  = 0.20f;  
     float sent_tail_decay = 0.995f; 
-    float enable_repair_gradient = false;
     float repair_tail_frac = 0.75f;       // IMPORTANT: 0.6-0.7 blob range
     int sent_tail_radius = 8;
-
-    float repair_hysteresis_tau = 0.0f;  // USELESS
-    float repair_trigger_activity = 0.0f; // USELESS
-    float random_unpin_prob = 0.0f; // USELESS
 
     float source_inject = 0.05f;
 
@@ -150,15 +145,11 @@ struct Params {
     float repair_cost_activity_k = 1.0f;  
     float repair_cost_super_k = 20.0f;   
 
-    float source_noise_sigma = 0.00f;     // useless
-    float source_noise_tau   = 100000.0f; // useless
-    float source_spatial_k   = 0.01f;     // useless
-
     // --- Precursor -> R_boost ---
     float P0 = 1.0f;            // baseline precursor level
     float P_alpha = 0.005f;    // relaxation rate toward P0
 
-    float P_damage_gain = 10.0f;   // 0 = old behavior, 2–5 is reasonable
+    float P_damage_gain = 0.0f;   // 0 = old behavior, 2–5 is reasonable
 
     float k_PR = 0.002f;         // conversion rate (k)
     float R_sat = 1.0f;         // saturation scale (RSAT): larger = higher local ceiling
@@ -208,9 +199,6 @@ struct World {
     std::vector<float> E_residual;
     std::vector<float> D_prev_tick;
     std::vector<int> top1_age, top5_age;
-    std::vector<float> source_bias;   // additive energy bias per voxel
-    std::vector<float> source_phase;  // slow phase accumulator
-    std::vector<float> source_applied;
     std::vector<float> sent_tail_local;  // size nvox
     std::vector<float> tmpX, tmpY;        // scratch for separable max-filter
 
@@ -241,8 +229,6 @@ struct World {
     float sent_q95_cached = 0.0f;
     float sent_q99_cached = 0.0f;
 
-    float sent_tail = 0.0f;   // running extreme activity scale
-
     // --- Temporal diagnostics ---
     std::vector<float> D_prev;
     double Dm_prev = 0.0;
@@ -268,9 +254,6 @@ struct World {
         top10_prev.resize(nvox, 0);
         top1_age.assign(nvox, 0);
         top5_age.assign(nvox, 0);
-        source_bias.assign(nvox, 0.0f);
-        source_phase.assign(nvox, 0.0f);
-        source_applied.assign(nvox, 0.0f);
         sent_tail_local.assign(nvox, 1e-6f);    
         tmpX.assign(nvox, 0.0f);
         tmpY.assign(nvox, 0.0f);
@@ -333,46 +316,6 @@ struct World {
     // Dominant axis computed from curr.W only
     // --------------------------------------------------------
     struct AxisInfo { Dir fwd, back, axis; };
-
-    struct RankedValue {
-        float value;
-        size_t index;
-    };
-
-    static void compute_ranks(
-        const std::vector<float>& v,
-        std::vector<double>& ranks_out
-    ) {
-        const size_t n = v.size();
-        std::vector<RankedValue> tmp(n);
-
-        for (size_t i = 0; i < n; i++) {
-            tmp[i] = { v[i], i };
-        }
-
-        std::sort(tmp.begin(), tmp.end(),
-                [](const RankedValue& a, const RankedValue& b) {
-                    return a.value < b.value;
-                });
-
-        ranks_out.resize(n);
-
-        size_t i = 0;
-        while (i < n) {
-            size_t j = i + 1;
-            while (j < n && tmp[j].value == tmp[i].value) {
-                j++;
-            }
-
-            // average rank for ties (1-based ranks)
-            double rank = 0.5 * (double(i + 1) + double(j));
-            for (size_t k = i; k < j; k++) {
-                ranks_out[tmp[k].index] = rank;
-            }
-
-            i = j;
-        }
-    }
 
     // ============================================================
     // Checkpoint I/O
@@ -525,33 +468,6 @@ struct World {
         return (bool)is;
     }
 
-    inline float repair_tail_frac_at_x(int x) const {
-            if (!p.enable_repair_gradient) {
-                return p.repair_tail_frac;
-            }
-            int w = p.nx / 4;
-
-            if (x < w)          return 0.6f;
-            else if (x < 2*w)   return 0.6f;
-            else if (x < 3*w)   return 0.6f;
-            else                return 0.6f;
-        }
-
-        inline void for_each_neighbor_radius(
-        int x0, int y0, int z0, int R,
-        const std::function<void(int,int,int,size_t)>& f
-    ) const {
-        for (int dz = -R; dz <= R; dz++)
-        for (int dy = -R; dy <= R; dy++)
-        for (int dx = -R; dx <= R; dx++) {
-            if (std::abs(dx) + std::abs(dy) + std::abs(dz) > R) continue;
-            int x = x0 + dx, y = y0 + dy, z = z0 + dz;
-            if (x<0||x>=p.nx||y<0||y>=p.ny||z<0||z>=p.nz) continue;
-            size_t j = idx(x,y,z);
-            f(x,y,z,j);
-        }
-    }
-
     void dump_fields() const {
         char fname[256];
         std::snprintf(fname, sizeof(fname),
@@ -681,42 +597,6 @@ struct World {
         return double(BCcnt) / double(Bcnt);
     }
 
-    static double spearman_rho(
-        const std::vector<float>& a,
-        const std::vector<float>& b
-    ) {
-        const size_t n = a.size();
-        if (b.size() != n || n == 0) return 0.0;
-
-        std::vector<double> ra, rb;
-        compute_ranks(a, ra);
-        compute_ranks(b, rb);
-
-        double mean_a = 0.0, mean_b = 0.0;
-        for (size_t i = 0; i < n; i++) {
-            mean_a += ra[i];
-            mean_b += rb[i];
-        }
-        mean_a /= double(n);
-        mean_b /= double(n);
-
-        double num = 0.0;
-        double den_a = 0.0;
-        double den_b = 0.0;
-
-        for (size_t i = 0; i < n; i++) {
-            double da = ra[i] - mean_a;
-            double db = rb[i] - mean_b;
-            num += da * db;
-            den_a += da * da;
-            den_b += db * db;
-        }
-
-        if (den_a <= 0.0 || den_b <= 0.0) return 0.0;
-        return num / std::sqrt(den_a * den_b);
-    }
-
-
     inline AxisInfo dominant_axis(size_t i) const {
         const float* w = &curr.W[i*6];
         float wxp = w[XP], wxn = w[XN];
@@ -821,8 +701,6 @@ struct World {
         routed_active_voxels_tick = 0;
         D_prev_tick = curr.D;
 
-        p.repair_tail_frac += 0.0f;
-
         // clear scratch
         std::fill(sent.begin(), sent.end(), 0.0f);
         std::fill(sent_dir.begin(), sent_dir.end(), 0.0f);
@@ -851,10 +729,8 @@ struct World {
             next.P[i] += alpha_eff * (p.P0 - curr.P[i]);
         }
 
-        update_source_noise();
         route_energy_curr_to_next();
         update_sent_tail();
-        update_repair_hysteresis();
         apply_damage_with_counterflow();
         // --------------------------------------------------------
         // TRANSIENT DAMAGE CUT
@@ -904,41 +780,6 @@ struct World {
         tick++;
     }
 
-    void update_source_noise() {
-        const float decay = std::exp(-1.0f / p.source_noise_tau);
-        const float drive = std::sqrt(1.0f - decay * decay);
-
-        for (int z = 0; z < p.nz; z++) {
-            for (int y = 0; y < p.ny; y++) {
-                for (int x = 0; x < p.nx; x++) {
-                    if (!is_source_voxel(x, y, z)) continue;
-
-                    size_t i = idx(x, y, z);
-
-                    // slow phase drift
-                    source_phase[i] += 0.001f;
-
-                    // wide spatial gradient (no lattice bias)
-                    float sx = std::sin(p.source_spatial_k * x + source_phase[i]);
-                    float sy = std::sin(p.source_spatial_k * y + 1.7f * source_phase[i]);
-                    float sz = std::sin(p.source_spatial_k * z + 2.3f * source_phase[i]);
-
-                    float spatial = (sx + sy + sz) * 0.333f;
-
-                    // stochastic component
-                    float noise = hash_to_f11(
-                        vh[i] ^ (tick * MIX_TICK) ^ 0xC0FFEEULL
-                    );
-
-                    source_bias[i] =
-                        decay * source_bias[i] +
-                        drive * p.source_noise_sigma * (0.7f * spatial + 0.3f * noise);
-                }
-            }
-        }
-    }
-
-
     // --------------------------------------------------------
     // ROUTING: curr->next only (scatter), record sent + sent_dir
     // --------------------------------------------------------
@@ -975,7 +816,7 @@ struct World {
             const float* w = &curr.W[i*6];
             for (int d = 0; d < 6; d++) {
                 float frac = w[d];
-                sent_dir[i*6 + d] = send / 6;
+                sent_dir[i*6 + d] = send * frac;
 
                 int j = nbr[i*6 + d];
                 if (j >= 0) next.E[(size_t)j] += delivered * frac;
@@ -1151,36 +992,6 @@ struct World {
                 vh[i] ^ (tick * MIX_TICK) ^ 0xA53C9E1FULL
             ) + 1.0f);
 
-            if (u01 < p.random_unpin_prob && next.D[i] < 2) {
-                next.D[i] += 3.0f; 
-            }
-
-        }
-    }
-    
-    void update_repair_hysteresis() {
-        float decay = 0.0f;
-        if (p.repair_hysteresis_tau > 0.0f) {
-            decay = std::exp(-1.0f / p.repair_hysteresis_tau);
-        } else {
-            decay = 0.0f; // no persistence
-        }
-
-        for (size_t i = 0; i < nvox; i++) {
-            // Trigger eligibility on sufficient activity
-            float a_norm = sent[i] / (p.source_inject + 1e-6f);
-            if (a_norm >= p.repair_trigger_activity) {
-                repair_elig[i] = 1.0f;
-            } else {
-                // Decay otherwise
-                repair_elig[i] *= decay;
-            }
-
-            if (repair_elig[i] < 1e-4f)
-                repair_elig[i] = 0.0f;
-            if (repair_elig[i] > 0.0f)
-                repair_eligible_tick++;
-
         }
     }
 
@@ -1194,17 +1005,9 @@ struct World {
     // - Cost is superlinear (quadratic in amount) + activity multiplier
     // --------------------------------------------------------
     void apply_perpendicular_repair() {
-        // --- per-tick diagnostics (counts) ---
-        uint64_t g_jneg=0, g_dead=0, g_aj0=0, g_thr=0, g_amt0=0, g_cost=0, g_ok=0;
         uint64_t active_repairers=0, eligible_repairers=0, eligible_active_repairers=0;
 
-        float max_aj = 0.0f, max_cost = 0.0f, min_Ej_seen = 1e9f;
-
-        // Compute sent_max ONCE (and only when you print)
-        float sent_max = 0.0f;
-        if (tick % p.print_every == 0) {
-            for (size_t k = 0; k < nvox; k++) sent_max = std::max(sent_max, sent[k]);
-        }
+        float max_aj = 0.0f;
 
         // IMPORTANT: ensure these are zeroed for this tick (if they persist as members)
         // If they are std::vector<float>, do this at the start of each tick elsewhere:
@@ -1228,33 +1031,23 @@ struct World {
             }
 
             auto try_repair_from = [&](int j) {
-                if (j < 0) { g_jneg++; return; }
+                if (j < 0) return;
                 eligible_repairers++;
 
                 float aj = sent[(size_t)j];
                 max_aj = std::max(max_aj, aj);
                 if (aj > 0.0f) active_repairers++;
-                if (aj <= 0.0f) { g_aj0++; return; }
-
-                // eligibility should change whether repair is allowed at all
-                float elig = repair_elig[(size_t)j]; // 0..1
-                if (elig <= 0.0f) return;
+                if (aj <= 0.0f) return;
 
                 // Gate: spiky / rare repair
                 float a_norm = sent[(size_t)j] / (curr.E[(size_t)j] + 1e-6f);
                 a_norm = clampf(a_norm, 0.0f, 4.0f); // allow >1
 
-                // if elig==0, impossible; if elig==1, normal threshold; if elig small, much harder
                 int x = int(i % p.nx);
-                float tail_frac = repair_tail_frac_at_x(x);
-                float threshold = tail_frac * sent_tail_local[i];
-                float eff_thresh = threshold * (1.0f + 2.0f*(1.0f - elig)); 
+                float tail_frac = p.repair_tail_frac;
+                float eff_thresh = tail_frac * sent_tail_local[i];
 
                 float Dgate = curr.D[i] / (curr.D[i] + 1e-2f); // ~0 when D small, ~1 when D big
-
-                // elig=1 -> thresh*1
-                // elig=0.5 -> thresh*2
-                // elig=0   -> thresh*3 (and you can also early-return at elig==0)
 
                 if (sent[(size_t)j] < eff_thresh) return;
 
@@ -1281,7 +1074,7 @@ struct World {
                 float r11 = hash_to_f11(vh[i] ^ (vh[(size_t)j] << 1) ^ (tick * MIX_PAIR));
                 float noise = 1.0f + p.repair_noise * r11;
                 
-                float amount = p.repair_strength * a_norm * repair_elig[j] * noise * Dgate;
+                float amount = p.repair_strength * a_norm * noise * Dgate;
 
                 // hard floor to avoid numeric extinction
                 amount = std::max(amount, 1e-4f);
@@ -1299,20 +1092,16 @@ struct World {
                 cost *= surf;
 
                 float Ej = E_residual[j];   // ONLY leftover energy can be spent
-                min_Ej_seen = std::min(min_Ej_seen, Ej);
-                max_cost = std::max(max_cost, cost);
 
-                if (cost > Ej) { g_cost++; return; } // no partial pay
+                if (cost > Ej) return; 
 
                 float R_spend = p.R_spend_k * amount;
                 R_boost[i] = std::max(0.0f, R_boost[i] - R_spend);
-
 
                 repair_delta[i] += amount;
                 repair_cost[(size_t)j] += cost;
                 E_residual[j] -= cost;
                 repair_events_tick++;
-                g_ok++;
             };
 
             try_repair_from(j0);
@@ -1415,15 +1204,6 @@ struct World {
             }
         }
 
-        double rho_D = 0.0;
-        if (have_prev_snapshot && corr_den_curr > 0.0 && corr_den_prev > 0.0) {
-            rho_D = corr_num / std::sqrt(corr_den_curr * corr_den_prev);
-        }
-        double rhoD_spearman = 0.0;
-        if (have_prev_snapshot) {
-            rhoD_spearman = spearman_rho(curr.D, D_prev);
-        }
-
         double v_all=0, v_rep=0, v_nrep=0;
         size_t n_all=0, n_rep=0, n_nrep=0;
 
@@ -1484,14 +1264,6 @@ struct World {
         double mean_flux = (routed_active_voxels_tick > 0) ? (routed_sum_tick / routed_active_voxels_tick) : 0.0;
         double flux_to_storage = (Es > 0.0) ? (routed_sum_tick / Es) : 0.0;
 
-
-        float max_elig = 0.0f;
-        float mean_elig = 0.0f;
-        for (size_t i = 0; i < nvox; i++) {
-            max_elig = std::max(max_elig, repair_elig[i]);
-            mean_elig += repair_elig[i];
-        }
-        mean_elig /= double(nvox);
 
         std::vector<size_t> idx(nvox);
         std::iota(idx.begin(), idx.end(), 0);
@@ -1621,8 +1393,6 @@ struct World {
             << " repair_events=" << repair_events_tick
             << " repair_eligible_frac=" << (double(repair_eligible_tick) / n)
             //<< " junction_density=" << junction_density
-            //<< " rhoD=" << rho_D
-            << " rhoD_s=" << rhoD_spearman
             << " BSI=" << BSI
             << " RFC=" << RFC
             << " EMU=" << EMU
