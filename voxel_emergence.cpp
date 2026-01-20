@@ -22,6 +22,8 @@
 #include <string>
 #include <fstream>
 #include <functional>
+#include <unordered_map>
+#include <sstream>
 
 // ============================================================
 // Utility
@@ -103,8 +105,7 @@ struct Params {
     float E_route_loss  = 0.1f;
 
     float D_ref = 10.0f;
-    float D_activity_gain = 0.02f;
-    float D_counterflow_gain = 0.01f;
+    float D_activity_gain = 0.025f;
     float D_slow_anneal = 0.00015f; // 0 no effect, 0.0005 melts
 
     float D_to_conduct_drop = 0.3704f; // 0 seems to do nothing? 100 makes some odd crystal thing
@@ -117,7 +118,7 @@ struct Params {
     float repair_energy_cost = 0.05f; // 0 lowers damage and increases size, 0.1 adapts
     float repair_noise = 0.2f; // generally low effect
 
-    float porous_conduct_floor = 0.0f;
+    float porous_conduct_floor = 0.01f;
     float porous_noise_boost = 0.5f;
 
     float repair_boost_decay = 0.9995f;
@@ -161,6 +162,168 @@ struct Params {
 
     // diagnostics
     int print_every = 1000;
+    bool load_from_file(const std::string& path) {
+        std::ifstream f(path);
+        if (!f) {
+            std::cerr << "Could not open params file: " << path << "\n";
+            return false;
+        }
+
+        std::unordered_map<std::string, std::string> kv;
+        std::string line;
+
+        while (std::getline(f, line)) {
+            // strip comments
+            auto hash = line.find('#');
+            if (hash != std::string::npos)
+                line = line.substr(0, hash);
+
+            auto eq = line.find('=');
+            if (eq == std::string::npos)
+                continue;
+
+            auto trim = [](std::string s) {
+                size_t a = s.find_first_not_of(" \t\r\n");
+                size_t b = s.find_last_not_of(" \t\r\n");
+                if (a == std::string::npos) return std::string();
+                return s.substr(a, b - a + 1);
+            };
+
+            std::string key = trim(line.substr(0, eq));
+            std::string val = trim(line.substr(eq + 1));
+
+            if (!key.empty())
+                kv[key] = val;
+        }
+
+        auto getf = [&](const char* k, float& x) {
+            if (kv.count(k)) x = std::stof(kv[k]);
+        };
+        auto geti = [&](const char* k, int& x) {
+            if (kv.count(k)) x = std::stoi(kv[k]);
+        };
+        auto getb = [&](const char* k, bool& x) {
+            if (kv.count(k)) {
+                std::string v = kv[k];
+                x = (v == "1" || v == "true" || v == "True");
+            }
+        };
+
+        // Grid
+        geti("nx", nx);
+        geti("ny", ny);
+        geti("nz", nz);
+
+        // Energy
+        getf("E_global_leak", E_global_leak);
+        getf("E_route_loss", E_route_loss);
+        getf("source_inject", source_inject);
+
+        // Damage
+        getf("D_ref", D_ref);
+        getf("D_activity_gain", D_activity_gain);
+        getf("D_slow_anneal", D_slow_anneal);
+        getf("D_to_conduct_drop", D_to_conduct_drop);
+        getf("D_to_noise", D_to_noise);
+
+        // Weights
+        getf("W_floor", W_floor);
+        getf("W_decay", W_decay);
+        getf("porous_conduct_floor", porous_conduct_floor);
+        getf("porous_noise_boost", porous_noise_boost);
+
+        // Repair
+        getf("repair_strength", repair_strength);
+        getf("repair_energy_cost", repair_energy_cost);
+        getf("repair_noise", repair_noise);
+        getf("repair_boost_decay", repair_boost_decay);
+        getf("repair_surface_k", repair_surface_k);
+        getf("repair_surface_power", repair_surface_power);
+        getf("repair_tail_frac", repair_tail_frac);
+        geti("sent_tail_radius", sent_tail_radius);
+        getf("R_spend_k", R_spend_k);
+
+        // Precursor
+        getf("P0", P0);
+        getf("P_alpha", P_alpha);
+        getf("P_damage_gain", P_damage_gain);
+        getf("k_PR", k_PR);
+        getf("R_sat", R_sat);
+        getf("act_thresh", act_thresh);
+        getf("act_k", act_k);
+
+        // Leakage / cost
+        getf("leak_k", leak_k);
+        getf("repair_cost_activity_k", repair_cost_activity_k);
+        getf("repair_cost_super_k", repair_cost_super_k);
+
+        // Diagnostics
+        geti("print_every", print_every);
+
+        return true;
+    }
+
+    bool set_param(const std::string& key, const std::string& val) {
+        auto to_f = [&](float& x) { x = std::stof(val); };
+        auto to_i = [&](int& x) { x = std::stoi(val); };
+        auto to_b = [&](bool& x) {
+            x = (val == "1" || val == "true" || val == "True");
+        };
+
+        // Grid
+        if (key == "nx") { to_i(nx); return true; }
+        if (key == "ny") { to_i(ny); return true; }
+        if (key == "nz") { to_i(nz); return true; }
+
+        // Energy
+        if (key == "E_global_leak") { to_f(E_global_leak); return true; }
+        if (key == "E_route_loss") { to_f(E_route_loss); return true; }
+        if (key == "source_inject") { to_f(source_inject); return true; }
+
+        // Damage
+        if (key == "D_ref") { to_f(D_ref); return true; }
+        if (key == "D_activity_gain") { to_f(D_activity_gain); return true; }
+        if (key == "D_slow_anneal") { to_f(D_slow_anneal); return true; }
+        if (key == "D_to_conduct_drop") { to_f(D_to_conduct_drop); return true; }
+        if (key == "D_to_noise") { to_f(D_to_noise); return true; }
+
+        // Weights
+        if (key == "W_floor") { to_f(W_floor); return true; }
+        if (key == "W_decay") { to_f(W_decay); return true; }
+        if (key == "porous_conduct_floor") { to_f(porous_conduct_floor); return true; }
+        if (key == "porous_noise_boost") { to_f(porous_noise_boost); return true; }
+
+        // Repair
+        if (key == "repair_strength") { to_f(repair_strength); return true; }
+        if (key == "repair_energy_cost") { to_f(repair_energy_cost); return true; }
+        if (key == "repair_noise") { to_f(repair_noise); return true; }
+        if (key == "repair_boost_decay") { to_f(repair_boost_decay); return true; }
+        if (key == "repair_surface_k") { to_f(repair_surface_k); return true; }
+        if (key == "repair_surface_power") { to_f(repair_surface_power); return true; }
+        if (key == "repair_tail_frac") { to_f(repair_tail_frac); return true; }
+        if (key == "sent_tail_radius") { to_i(sent_tail_radius); return true; }
+        if (key == "R_spend_k") { to_f(R_spend_k); return true; }
+
+        // Precursor
+        if (key == "P0") { to_f(P0); return true; }
+        if (key == "P_alpha") { to_f(P_alpha); return true; }
+        if (key == "P_damage_gain") { to_f(P_damage_gain); return true; }
+        if (key == "k_PR") { to_f(k_PR); return true; }
+        if (key == "R_sat") { to_f(R_sat); return true; }
+        if (key == "act_thresh") { to_f(act_thresh); return true; }
+        if (key == "act_k") { to_f(act_k); return true; }
+
+        // Leakage / cost
+        if (key == "leak_k") { to_f(leak_k); return true; }
+        if (key == "repair_cost_activity_k") { to_f(repair_cost_activity_k); return true; }
+        if (key == "repair_cost_super_k") { to_f(repair_cost_super_k); return true; }
+
+        // Diagnostics
+        if (key == "print_every") { to_i(print_every); return true; }
+
+        return false;
+    }
+
 };
 
 // ============================================================
@@ -201,6 +364,11 @@ struct World {
     std::vector<int> top1_age, top5_age;
     std::vector<float> sent_tail_local;  // size nvox
     std::vector<float> tmpX, tmpY;        // scratch for separable max-filter
+    std::vector<uint8_t> topR_prev;
+    bool have_topR_prev = false;
+
+    std::string metrics_path = "regime_metrics.csv";
+    bool metrics_written = false;
 
     std::vector<uint8_t> top1_prev, top5_prev, top10_prev;
     bool have_top_prev = false;
@@ -257,6 +425,9 @@ struct World {
         sent_tail_local.assign(nvox, 1e-6f);    
         tmpX.assign(nvox, 0.0f);
         tmpY.assign(nvox, 0.0f);
+        fossil_C.assign(nvox, 0);
+        topR_prev.assign(nvox, 0);
+        have_topR_prev = false;
 
         D_prev_tick.assign(nvox, 0.0f);
 
@@ -311,6 +482,49 @@ struct World {
             vh[i] = hash_u64(seed ^ (uint64_t)i);
         }
     }
+
+    void append_metrics_csv(
+        double BSI,
+        double RFC,
+        double EMU,
+        double SPI,
+        float D_q50,
+        float D_q95,
+        float sent_q95
+    ) {
+        bool exists = false;
+        {
+            std::ifstream f(metrics_path);
+            exists = f.good();
+        }
+
+        std::ofstream out(metrics_path, std::ios::app);
+
+        // Header (only once)
+        if (!exists) {
+            out
+                << "seed,nx,ny,nz,"
+                << "sent_tail_radius,repair_tail_frac,W_decay,"
+                << "BSI,RFC,EMU,SPI,"
+                << "D_q50,D_q95,sent_q95\n";
+        }
+
+        out
+            << seed << ","
+            << p.nx << "," << p.ny << "," << p.nz << ","
+            << p.sent_tail_radius << ","
+            << p.repair_tail_frac << ","
+            << p.W_decay << ","
+            << BSI << ","
+            << RFC << ","
+            << EMU << ","
+            << SPI << ","
+            << D_q50 << ","
+            << D_q95 << ","
+            << sent_q95
+            << "\n";
+    }
+
 
     // --------------------------------------------------------
     // Dominant axis computed from curr.W only
@@ -731,7 +945,9 @@ struct World {
 
         route_energy_curr_to_next();
         update_sent_tail();
-        apply_damage_with_counterflow();
+        apply_perpendicular_repair();
+        evolve_weights_curr_to_next();
+
         // --------------------------------------------------------
         // TRANSIENT DAMAGE CUT
         // --------------------------------------------------------
@@ -749,8 +965,6 @@ struct World {
                 }
             }
         }
-        apply_perpendicular_repair();
-        evolve_weights_curr_to_next();
 
         for (size_t i=0; i<nvox; i++) {
             float activity = sent[i] + repair_delta[i];
@@ -939,62 +1153,6 @@ struct World {
         }
     }
 
-
-    // --------------------------------------------------------
-    // DAMAGE: activity + counterflow penalty (exact definition)
-    // Counterflow: for voxel i, consider ONLY its perpendicular neighbors.
-    // Penalize how much those neighbors sent in direction ax.back.
-    // --------------------------------------------------------
-    void apply_damage_with_counterflow() {
-        for (size_t i=0; i<nvox; i++) {
-            float D = curr.D[i];
-
-            D += p.D_activity_gain * sent[i];
-
-            AxisInfo ax = dominant_axis(i);
-            const int ax_back = (int)ax.back;
-
-            float counter = 0.0f;
-
-            if (ax.axis == XP) {
-                int j0 = nbr[i*6 + YP];
-                int j1 = nbr[i*6 + YN];
-                int j2 = nbr[i*6 + ZP];
-                int j3 = nbr[i*6 + ZN];
-                if (j0 >= 0) counter += sent_dir[(size_t)j0*6 + ax_back];
-                if (j1 >= 0) counter += sent_dir[(size_t)j1*6 + ax_back];
-                if (j2 >= 0) counter += sent_dir[(size_t)j2*6 + ax_back];
-                if (j3 >= 0) counter += sent_dir[(size_t)j3*6 + ax_back];
-            } else if (ax.axis == YP) {
-                int j0 = nbr[i*6 + XP];
-                int j1 = nbr[i*6 + XN];
-                int j2 = nbr[i*6 + ZP];
-                int j3 = nbr[i*6 + ZN];
-                if (j0 >= 0) counter += sent_dir[(size_t)j0*6 + ax_back];
-                if (j1 >= 0) counter += sent_dir[(size_t)j1*6 + ax_back];
-                if (j2 >= 0) counter += sent_dir[(size_t)j2*6 + ax_back];
-                if (j3 >= 0) counter += sent_dir[(size_t)j3*6 + ax_back];
-            } else {
-                int j0 = nbr[i*6 + XP];
-                int j1 = nbr[i*6 + XN];
-                int j2 = nbr[i*6 + YP];
-                int j3 = nbr[i*6 + YN];
-                if (j0 >= 0) counter += sent_dir[(size_t)j0*6 + ax_back];
-                if (j1 >= 0) counter += sent_dir[(size_t)j1*6 + ax_back];
-                if (j2 >= 0) counter += sent_dir[(size_t)j2*6 + ax_back];
-                if (j3 >= 0) counter += sent_dir[(size_t)j3*6 + ax_back];
-            }
-
-            D += p.D_counterflow_gain * counter;
-            
-            next.D[i] = D;
-            float u01 = 0.5f * (hash_to_f11(
-                vh[i] ^ (tick * MIX_TICK) ^ 0xA53C9E1FULL
-            ) + 1.0f);
-
-        }
-    }
-
     // --------------------------------------------------------
     // REPAIR (scarce):
     // - Perpendicular neighbors only (geometry)
@@ -1015,6 +1173,7 @@ struct World {
         // std::fill(repair_cost.begin(),  repair_cost.end(),  0.0f);
 
         for (size_t i=0; i<nvox; i++) {
+            next.D[i] += p.D_activity_gain * sent[i];
             AxisInfo ax = dominant_axis(i);
 
             // Perp neighbors of TARGET voxel i (geometry)
@@ -1248,6 +1407,31 @@ struct World {
         sent_q95_cached = sent_q95;
         sent_q99_cached = sent_q99;
 
+        // ------------------------
+        // Repair Gating Index
+        // ------------------------
+        int repair_total = 0;
+        int repair_high_flux = 0;
+        int high_flux_total = 0;
+
+        float flux_thresh = sent_q95_cached;  // or sent_q99_cached
+
+        for (size_t i = 0; i < nvox; i++) {
+            bool high_flux = sent[i] >= flux_thresh;
+            bool repaired  = repair_delta[i] > 0.0f;
+
+            if (repaired) repair_total++;
+            if (high_flux) high_flux_total++;
+            if (high_flux && repaired) repair_high_flux++;
+        }
+
+        double P_R = (double)repair_total / double(nvox);
+        double P_R_given_S = high_flux_total > 0
+            ? (double)repair_high_flux / double(high_flux_total)
+            : 0.0;
+
+        double RGI = (P_R > 1e-9) ? (P_R_given_S / P_R) : 0.0;
+
         // Junction density: voxels with >2 "significant" outgoing directions
         // (computed from curr.W; threshold chosen for interpretability)
         const float w_sig = 0.20f;
@@ -1364,6 +1548,60 @@ struct World {
             Emax_local = std::max(Emax_local, curr.E[i]);
         };
 
+        // ------------------------
+        // Repair Localization Index (entropy-based)
+        // ------------------------
+        double H = 0.0;
+        double Rsum = 0.0;
+
+        for (size_t i = 0; i < nvox; i++) {
+            Rsum += repair_delta[i];
+        }
+
+        if (Rsum > 0.0) {
+            for (size_t i = 0; i < nvox; i++) {
+                double p = repair_delta[i] / Rsum;
+                if (p > 1e-12) {
+                    H -= p * std::log(p);
+                }
+            }
+        }
+
+        double Hmax = std::log(double(nvox));
+        double RLI = (Hmax > 0.0) ? (1.0 - H / Hmax) : 0.0;
+
+        // ------------------------
+        // Structural Persistence Index (SPI)
+        // ------------------------
+        std::vector<size_t> ridx(nvox);
+        std::iota(ridx.begin(), ridx.end(), 0);
+
+        size_t K = nvox / 50;  // top 2% repair voxels
+        std::nth_element(
+            ridx.begin(),
+            ridx.begin() + K,
+            ridx.end(),
+            [&](size_t a, size_t b) {
+                return repair_delta[a] > repair_delta[b];
+            }
+        );
+
+        std::vector<uint8_t> topR(nvox, 0);
+        for (size_t i = 0; i < K; i++)
+            if (repair_delta[ridx[i]] > 0.0f)
+                topR[ridx[i]] = 1;
+
+        double SPI = 0.0;
+        if (have_topR_prev && K > 0) {
+            size_t inter = 0;
+            for (size_t i = 0; i < nvox; i++)
+                inter += (topR[i] & topR_prev[i]);
+            SPI = double(inter) / double(K);
+        }
+
+        topR_prev.swap(topR);
+        have_topR_prev = true;
+
         std::cout
             << "tick=" << tick
             << " E_sum=" << std::fixed << std::setprecision(3) << Es
@@ -1394,9 +1632,28 @@ struct World {
             << " repair_eligible_frac=" << (double(repair_eligible_tick) / n)
             //<< " junction_density=" << junction_density
             << " BSI=" << BSI
-            << " RFC=" << RFC
-            << " EMU=" << EMU
+            // << " RFC=" << RFC
+            << " RGI=" << RGI
+            << " RLI=" << RLI
+            << " SPI=" << SPI
+            // << " EMU=" << EMU
             << "\n";
+
+        // ------------------------
+        // CSV snapshot at 15k ticks
+        // ------------------------
+        if (!metrics_written && tick >= 15000) {
+            append_metrics_csv(
+                BSI,
+                RFC,
+                EMU,
+                SPI,
+                D_q50,
+                D_q95,
+                sent_q95_cached
+            );
+            metrics_written = true;
+        }
 
         D_prev = curr.D;     // vector copy, but only every print_every
         Dm_prev = Dm;
@@ -1412,7 +1669,7 @@ int main(int argc, char** argv) {
     
     Params p;
 
-    int steps = 200000000;
+    int steps = 15002;
     uint64_t seed = 15ull;
     std::cout << "BINARY BUILD ID: "
           << __DATE__ << " " << __TIME__
@@ -1421,12 +1678,41 @@ int main(int argc, char** argv) {
     
     std::string load_path, save_path;
     int64_t save_at = -1;
+    std::string param_file;
+    std::vector<std::pair<std::string, std::string>> overrides;
 
     for (int i=1; i<argc; i++) {
         std::string a = argv[i];
         if (a == "--load" && i+1<argc) load_path = argv[++i];
         else if (a == "--save" && i+1<argc) save_path = argv[++i];
         else if (a == "--save_at" && i+1<argc) save_at = std::stoll(argv[++i]);
+        else if (a == "--params" && i+1 < argc) param_file = argv[++i];
+        else if (a == "--set" && i+1 < argc) {
+            std::string kv = argv[++i];
+            auto eq = kv.find('=');
+            if (eq == std::string::npos) {
+                std::cerr << "Bad --set format, expected key=value\n";
+                return 1;
+            }
+            overrides.emplace_back(
+                kv.substr(0, eq),
+                kv.substr(eq + 1)
+            );
+        }
+    }
+
+    if (!param_file.empty()) {
+        if (!p.load_from_file(param_file)) {
+            std::cerr << "Failed to load params\n";
+            return 1;
+        }
+    }
+
+    for (auto& [k, v] : overrides) {
+        if (!p.set_param(k, v)) {
+            std::cerr << "Unknown parameter: " << k << "\n";
+            return 1;
+        }
     }
 
     World w(p, seed);
