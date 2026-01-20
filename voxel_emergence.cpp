@@ -1679,6 +1679,7 @@ int main(int argc, char** argv) {
     std::string load_path, save_path;
     int64_t save_at = -1;
     std::string param_file;
+    std::string metrics_path;
     std::vector<std::pair<std::string, std::string>> overrides;
 
     for (int i=1; i<argc; i++) {
@@ -1700,6 +1701,7 @@ int main(int argc, char** argv) {
             );
         }
         else if (a == "--seed" && i+1 < argc) seed = argv[++i];
+        else if (a == "--metrics" && i+1 < argc) metrics_path = argv[++i];
     }
 
     if (!param_file.empty()) {
@@ -1717,6 +1719,9 @@ int main(int argc, char** argv) {
     }
 
     World w(p, seed);
+    if (!metrics_path.empty()) {
+        w.metrics_path = metrics_path;
+    }
 
     if (!load_path.empty()) {
         if (!w.load_checkpoint(load_path)) {
