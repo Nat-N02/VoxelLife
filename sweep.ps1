@@ -18,7 +18,7 @@ foreach ($r in $radii) {
           --set "sent_tail_radius=$r" `
           --set "repair_tail_frac=$f" `
           --set "W_decay=$w" `
-          --set "seed=$s"
+          --seed $s
 
       }
     }

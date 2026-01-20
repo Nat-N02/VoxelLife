@@ -1699,6 +1699,7 @@ int main(int argc, char** argv) {
                 kv.substr(eq + 1)
             );
         }
+        else if (a == "--seed" && i+1 < argc) seed = argv[++i];
     }
 
     if (!param_file.empty()) {
