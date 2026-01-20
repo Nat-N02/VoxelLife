@@ -1,7 +1,7 @@
 # Grid
-nx = 64
-ny = 64
-nz = 4
+nx = 48
+ny = 48
+nz = 3
 
 # Energy
 E_global_leak = 0.01

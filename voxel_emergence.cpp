@@ -486,7 +486,7 @@ struct World {
     void append_metrics_csv(
         double BSI,
         double RFC,
-        double EMU,
+        double RLI,
         double SPI,
         float D_q50,
         float D_q95,
@@ -505,7 +505,7 @@ struct World {
             out
                 << "seed,nx,ny,nz,"
                 << "sent_tail_radius,repair_tail_frac,W_decay,"
-                << "BSI,RFC,EMU,SPI,"
+                << "BSI,RFC,RLI,SPI,"
                 << "D_q50,D_q95,sent_q95\n";
         }
 
@@ -517,7 +517,7 @@ struct World {
             << p.W_decay << ","
             << BSI << ","
             << RFC << ","
-            << EMU << ","
+            << RLI << ","
             << SPI << ","
             << D_q50 << ","
             << D_q95 << ","
@@ -877,7 +877,7 @@ struct World {
     // Sources (example: z==0 plane)
     // --------------------------------------------------------
     inline bool is_source_voxel(int x,int y,int z) const {
-        return (z == 0 || z == 2);
+        return (z == 1);
     }
 
     // --------------------------------------------------------
@@ -1658,7 +1658,6 @@ struct World {
         D_prev = curr.D;     // vector copy, but only every print_every
         Dm_prev = Dm;
         have_prev_snapshot = true;
-        dump_fields();
     }
 };
 
@@ -1671,10 +1670,6 @@ int main(int argc, char** argv) {
 
     int steps = 15002;
     uint64_t seed = 15ull;
-    std::cout << "BINARY BUILD ID: "
-          << __DATE__ << " " << __TIME__
-          << " | seed=" << seed
-          << "\n";
     
     std::string load_path, save_path;
     int64_t save_at = -1;
@@ -1700,9 +1695,14 @@ int main(int argc, char** argv) {
                 kv.substr(eq + 1)
             );
         }
-        else if (a == "--seed" && i+1 < argc) seed = argv[++i];
+        else if (a == "--seed" && i+1 < argc) seed = atoi(argv[++i]);
         else if (a == "--metrics" && i+1 < argc) metrics_path = argv[++i];
     }
+    
+    std::cout << "BINARY BUILD ID: "
+          << __DATE__ << " " << __TIME__
+          << " | seed=" << seed
+          << "\n";
 
     if (!param_file.empty()) {
         if (!p.load_from_file(param_file)) {
