@@ -373,6 +373,10 @@ struct World {
     std::vector<uint8_t> top1_prev, top5_prev, top10_prev;
     bool have_top_prev = false;
 
+    // --- FTP ---
+    std::vector<uint8_t> topo_mask_prev;
+    bool have_topo_prev = false;
+
     // Precomputed neighbors (size nvox*6), -1 = out of bounds
     std::vector<int> nbr;
 
@@ -428,6 +432,8 @@ struct World {
         fossil_C.assign(nvox, 0);
         topR_prev.assign(nvox, 0);
         have_topR_prev = false;
+        topo_mask_prev.assign(nvox, 0);
+        have_topo_prev = false;
 
         D_prev_tick.assign(nvox, 0.0f);
 
@@ -488,6 +494,7 @@ struct World {
         double RFC,
         double RLI,
         double SPI,
+        double FTP,
         float D_q50,
         float D_q95,
         float sent_q95
@@ -505,7 +512,7 @@ struct World {
             out
                 << "seed,nx,ny,nz,"
                 << "sent_tail_radius,repair_tail_frac,W_decay,"
-                << "BSI,RFC,RLI,SPI,"
+                << "BSI,RFC,RLI,SPI,FTP,"
                 << "D_q50,D_q95,sent_q95\n";
         }
 
@@ -519,6 +526,7 @@ struct World {
             << RFC << ","
             << RLI << ","
             << SPI << ","
+            << FTP << ","
             << D_q50 << ","
             << D_q95 << ","
             << sent_q95
@@ -759,6 +767,33 @@ struct World {
 
         if (grad_count == 0 || boundary_count == 0) return 0.0;
         return (grad_boundary_sum / boundary_count) / (grad_sum / grad_count);
+    }
+
+    inline uint8_t build_topo_mask(size_t i, int K = 2) const {
+        // K = number of dominant outgoing directions to track
+        const float* w = &curr.W[i*6];
+
+        // Find top-K indices
+        int best[2] = {-1, -1};
+        float bv[2] = {-1e30f, -1e30f};
+
+        for (int d = 0; d < 6; d++) {
+            float v = w[d];
+            if (v > bv[0]) {
+                bv[1] = bv[0]; best[1] = best[0];
+                bv[0] = v;     best[0] = d;
+            } else if (v > bv[1]) {
+                bv[1] = v;
+                best[1] = d;
+            }
+        }
+
+        uint8_t mask = 0;
+        for (int i = 0; i < K; i++) {
+            if (best[i] >= 0)
+                mask |= (1u << best[i]);
+        }
+        return mask;
     }
 
     double compute_RFC(const LagBuffer& buf) {
@@ -1602,6 +1637,40 @@ struct World {
         topR_prev.swap(topR);
         have_topR_prev = true;
 
+        // ------------------------
+        // Flow Topology Persistence (FTP)
+        // ------------------------
+        size_t edge_total = 0;
+        size_t edge_persist = 0;
+
+        std::vector<uint8_t> topo_mask_curr(nvox);
+
+        for (size_t i = 0; i < nvox; i++) {
+            topo_mask_curr[i] = build_topo_mask(i, 2);
+        }
+
+        if (have_topo_prev) {
+            for (size_t i = 0; i < nvox; i++) {
+                uint8_t prev = topo_mask_prev[i];
+                uint8_t curr = topo_mask_curr[i];
+
+                // Count bits in current mask
+                int bits = __builtin_popcount(curr);
+                edge_total += bits;
+
+                // Count overlapping bits
+                uint8_t overlap = prev & curr;
+                edge_persist += __builtin_popcount(overlap);
+            }
+        }
+
+        double FTP = (edge_total > 0)
+            ? double(edge_persist) / double(edge_total)
+            : 0.0;
+
+        topo_mask_prev.swap(topo_mask_curr);
+        have_topo_prev = true;
+
         std::cout
             << "tick=" << tick
             << " E_sum=" << std::fixed << std::setprecision(3) << Es
@@ -1636,6 +1705,7 @@ struct World {
             << " RGI=" << RGI
             << " RLI=" << RLI
             << " SPI=" << SPI
+            << " FTP=" << FTP
             // << " EMU=" << EMU
             << "\n";
 
@@ -1646,8 +1716,9 @@ struct World {
             append_metrics_csv(
                 BSI,
                 RFC,
-                EMU,
+                RLI,
                 SPI,
+                FTP,
                 D_q50,
                 D_q95,
                 sent_q95_cached
