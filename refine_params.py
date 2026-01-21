@@ -30,7 +30,7 @@ for _, row in hot.iterrows():
     r, f, w = row
 
     # --- Radius (topology only) ---
-    R = [rr for rr in (r-1, r, r+1) if rr in R_vals]
+    R = [rr for rr in (r-1, r, r+1) if rr >= 1]
 
     # --- Repair fraction (linear zoom) ---
     F = {f}
