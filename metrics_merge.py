@@ -1,7 +1,7 @@
 import os
 import glob
 
-METRICS_DIR = "metrics3"
+METRICS_DIR = "metrics"
 OUT_FILE = "all_metrics.csv"
 
 files = sorted(glob.glob(os.path.join(METRICS_DIR, "*.csv")))
