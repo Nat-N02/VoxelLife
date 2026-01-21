@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-
 set -euo pipefail
 
 # =========================
@@ -12,8 +11,10 @@ METRICS_DIR="metrics"
 SEEDS=(1 2 3 4)
 
 MAX_JOBS=8
+DONE_FILE="completed_runs.txt"
 
 mkdir -p "$METRICS_DIR"
+touch "$DONE_FILE"
 
 runId=0
 running=0
@@ -29,32 +30,45 @@ wait_for_slot() {
 }
 
 # =========================
-# MAIN LOOP
+# MAIN LOOP (NO SUBSHELL)
 # =========================
-# Skip CSV header, read rows
-tail -n +2 "$REFINE_LIST" | while IFS=, read -r r f w; do
-    for s in "${SEEDS[@]}"; do
-        runId=$((runId + 1))
-        wait_for_slot
+{
+    read  # skip header
+    while IFS=, read -r r f w; do
+        for s in "${SEEDS[@]}"; do
 
-        metricsFile="$METRICS_DIR/metrics_${runId}_r${r}_f${f}_w${w}_s${s}.csv"
+            key="${r},${f},${w},${s}"
 
-        echo "QUEUE radius=$r repair_frac=$f W_decay=$w seed=$s"
-        echo "  -> $metricsFile"
+            # ---- Crash recovery: skip completed ----
+            if grep -q "^$key$" "$DONE_FILE"; then
+                continue
+            fi
 
-        (
-            "$EXE" \
-              --params "$PARAMFILE" \
-              --set "sent_tail_radius=$r" \
-              --set "repair_tail_frac=$f" \
-              --set "W_decay=$w" \
-              --seed "$s" \
-              --metrics "$metricsFile"
-        ) &
+            runId=$((runId + 1))
+            wait_for_slot
 
-        running=$((running + 1))
+            metricsFile="$METRICS_DIR/metrics_${runId}_r${r}_f${f}_w${w}_s${s}.csv"
+
+            echo "QUEUE radius=$r repair_frac=$f W_decay=$w seed=$s"
+            echo "  -> $metricsFile"
+
+            (
+                "$EXE" \
+                  --params "$PARAMFILE" \
+                  --set "sent_tail_radius=$r" \
+                  --set "repair_tail_frac=$f" \
+                  --set "W_decay=$w" \
+                  --seed "$s" \
+                  --metrics "$metricsFile"
+
+                # ---- Mark done only if successful ----
+                echo "$key" >> "$DONE_FILE"
+            ) &
+
+            running=$((running + 1))
+        done
     done
-done
+} < "$REFINE_LIST"
 
 # =========================
 # WAIT FOR ALL
