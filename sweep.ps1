@@ -1,3 +1,4 @@
+$refineList = Import-Csv "refinement_jobs.csv"
 $exe = Join-Path $PSScriptRoot "voxel.exe"
 $paramfile = Join-Path $PSScriptRoot "params.txt"
 $metricsDir = Join-Path $PSScriptRoot "metrics"
@@ -25,37 +26,36 @@ function Wait-ForSlot {
 
 $runId = 0
 
-foreach ($r in $radii) {
-  foreach ($f in $repairs) {
-    foreach ($w in $decays) {
-      foreach ($s in $seeds) {
+foreach ($row in $refineList) {
+  foreach ($s in $seeds) {
 
-        $runId++
-        Wait-ForSlot $MAX_JOBS
+    $r = [int]$row.sent_tail_radius
+    $f = [double]$row.repair_tail_frac
+    $w = [double]$row.W_decay
 
-        # Build filename OUTSIDE the job
-        $metricsFile = Join-Path $metricsDir ("metrics_{0}_r{1}_f{2}_w{3}_s{4}.csv" -f `
-            $runId, $r, $f, $w, $s)
+    $runId++
+    Wait-ForSlot $MAX_JOBS
 
-        Write-Host "QUEUE radius=$r repair_frac=$f W_decay=$w seed=$s"
-        Write-Host "  -> $metricsFile"
+    $metricsFile = Join-Path $metricsDir ("metrics_{0}_r{1}_f{2}_w{3}_s{4}.csv" -f `
+        $runId, $r, $f, $w, $s)
 
-        $job = Start-Job -ScriptBlock {
-          param($exe, $paramfile, $r, $f, $w, $s, $metricsFile)
+    Write-Host "QUEUE radius=$r repair_frac=$f W_decay=$w seed=$s"
+    Write-Host "  -> $metricsFile"
 
-          & $exe `
-            --params $paramfile `
-            --set "sent_tail_radius=$r" `
-            --set "repair_tail_frac=$f" `
-            --set "W_decay=$w" `
-            --seed $s `
-            --metrics $metricsFile
+    $job = Start-Job -ScriptBlock {
+      param($exe, $paramfile, $r, $f, $w, $s, $metricsFile)
 
-        } -ArgumentList $exe, $paramfile, $r, $f, $w, $s, $metricsFile
+      & $exe `
+        --params $paramfile `
+        --set "sent_tail_radius=$r" `
+        --set "repair_tail_frac=$f" `
+        --set "W_decay=$w" `
+        --seed $s `
+        --metrics $metricsFile
 
-        $script:jobs.Add($job) | Out-Null
-      }
-    }
+    } -ArgumentList $exe, $paramfile, $r, $f, $w, $s, $metricsFile
+
+    $script:jobs.Add($job) | Out-Null
   }
 }
 
