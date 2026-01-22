@@ -1716,7 +1716,6 @@ struct World {
             << " flux/storage=" << flux_to_storage
             << " repair_events=" << repair_events_tick
             << " f_flux=" << f_flux
-            << " f_econ=" << f_econ
             << " f_succ=" << f_succ
             //<< " junction_density=" << junction_density
             << " BSI=" << BSI
