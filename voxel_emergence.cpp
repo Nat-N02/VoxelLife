@@ -367,6 +367,11 @@ struct World {
     std::vector<uint8_t> topR_prev;
     bool have_topR_prev = false;
 
+    // --- New gating metrics ---
+    uint64_t flux_dirs_tick = 0;     // geometry
+    uint64_t econ_dirs_tick = 0;     // geometry + economy
+    uint64_t success_dirs_tick = 0;  // actual repairs
+
     std::string metrics_path = "regime_metrics.csv";
     bool metrics_written = false;
 
@@ -949,6 +954,10 @@ struct World {
         routed_sum_tick = 0.0;
         routed_active_voxels_tick = 0;
         D_prev_tick = curr.D;
+        flux_dirs_tick = 0;
+        econ_dirs_tick = 0;
+        success_dirs_tick = 0;
+
 
         // clear scratch
         std::fill(sent.begin(), sent.end(), 0.0f);
@@ -1202,11 +1211,6 @@ struct World {
 
         float max_aj = 0.0f;
 
-        // IMPORTANT: ensure these are zeroed for this tick (if they persist as members)
-        // If they are std::vector<float>, do this at the start of each tick elsewhere:
-        // std::fill(repair_delta.begin(), repair_delta.end(), 0.0f);
-        // std::fill(repair_cost.begin(),  repair_cost.end(),  0.0f);
-
         for (size_t i=0; i<nvox; i++) {
             next.D[i] += p.D_activity_gain * sent[i];
             AxisInfo ax = dominant_axis(i);
@@ -1244,8 +1248,10 @@ struct World {
                 float Dgate = curr.D[i] / (curr.D[i] + 1e-2f); // ~0 when D small, ~1 when D big
 
                 if (sent[(size_t)j] < eff_thresh) return;
+                flux_dirs_tick++;   // geometry gate passed
 
                 eligible_active_repairers++;
+                repair_eligible_tick++;
 
                 float R = R_boost[i];
 
@@ -1292,6 +1298,7 @@ struct World {
                 float R_spend = p.R_spend_k * amount;
                 R_boost[i] = std::max(0.0f, R_boost[i] - R_spend);
 
+                success_dirs_tick++;
                 repair_delta[i] += amount;
                 repair_cost[(size_t)j] += cost;
                 E_residual[j] -= cost;
@@ -1671,6 +1678,16 @@ struct World {
         topo_mask_prev.swap(topo_mask_curr);
         have_topo_prev = true;
 
+        double max_dirs = 4.0 * n;   // 4 perpendicular directions per voxel
+
+        double f_flux = (max_dirs > 0)
+            ? double(flux_dirs_tick) / max_dirs
+            : 0.0;
+
+        double f_succ = (flux_dirs_tick > 0)
+            ? double(success_dirs_tick) / double(flux_dirs_tick)
+            : 0.0;
+
         std::cout
             << "tick=" << tick
             << " E_sum=" << std::fixed << std::setprecision(3) << Es
@@ -1698,10 +1715,12 @@ struct World {
             << " mean_flux=" << mean_flux
             << " flux/storage=" << flux_to_storage
             << " repair_events=" << repair_events_tick
-            << " repair_eligible_frac=" << (double(repair_eligible_tick) / n)
+            << " f_flux=" << f_flux
+            << " f_econ=" << f_econ
+            << " f_succ=" << f_succ
             //<< " junction_density=" << junction_density
             << " BSI=" << BSI
-            // << " RFC=" << RFC
+            << " RFC=" << RFC
             << " RGI=" << RGI
             << " RLI=" << RLI
             << " SPI=" << SPI
@@ -1729,6 +1748,7 @@ struct World {
         D_prev = curr.D;     // vector copy, but only every print_every
         Dm_prev = Dm;
         have_prev_snapshot = true;
+        dump_fields();
     }
 };
 
@@ -1739,7 +1759,7 @@ int main(int argc, char** argv) {
     
     Params p;
 
-    int steps = 15002;
+    int steps = 1500000002;
     uint64_t seed = 15ull;
     
     std::string load_path, save_path;

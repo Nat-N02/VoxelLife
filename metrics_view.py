@@ -20,6 +20,7 @@ METRICS = [
     "RFC",
     "RLI",
     "SPI",
+    "FTP",
     "D_q50",
     "D_q95",
     "sent_q95"

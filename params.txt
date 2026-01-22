@@ -17,7 +17,7 @@ D_to_noise = 0.03
 
 # Weights
 W_floor = 1e-4
-W_decay = 0.0
+W_decay = -1e-4
 porous_conduct_floor = 0.01
 porous_noise_boost = 0.5
 
