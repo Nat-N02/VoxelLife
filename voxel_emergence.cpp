@@ -127,12 +127,12 @@ struct Params {
     float repair_surface_power = 1.2f;   // 1 = linear, 2 = harsh
 
     // --- blob splitting (damage wall) ---
-    bool enable_cut = false;
+    bool enable_cut = true;
     int cut_start_tick = 16000;
-    int cut_end_tick   = 17000;          // duration ~5000 ticks
+    int cut_end_tick   = 16100;          // duration ~5000 ticks
     int cut_axis = 1;                    // 0=X, 1=Y, 2=Z
     float cut_frac = 0.5f;              // where the plane is (0..1)
-    float cut_thickness = 10.0f;          // in voxels
+    float cut_thickness = 150.0f;          // in voxels
     float cut_damage = 0.8f;             // fraction of D_ref
 
     float sent_tail_rise  = 0.20f;  
@@ -365,6 +365,18 @@ struct World {
     std::vector<float> sent_tail_local;  // size nvox
     std::vector<float> tmpX, tmpY;        // scratch for separable max-filter
     std::vector<uint8_t> topR_prev;
+    // --- PID spatial analysis ---
+    std::vector<uint8_t> pid_mask;
+    std::vector<int> pid_labels;
+    std::vector<uint8_t> tracked_pid_prev;   // 1 if voxel in PID at baseline
+    bool have_tracked_pid = false;
+    int tracked_label = -1;
+    double baseline_PID_size = 0;
+    double baseline_BSI = 0;
+    double baseline_FTP = 0;
+    double baseline_Din = 0, baseline_Dout = 0, baseline_Gb = 0;
+    uint64_t perturb_tick = 0;
+
     bool have_topR_prev = false;
 
     // --- New gating metrics ---
@@ -439,7 +451,8 @@ struct World {
         have_topR_prev = false;
         topo_mask_prev.assign(nvox, 0);
         have_topo_prev = false;
-
+        pid_mask.assign(nvox, 0);
+        pid_labels.assign(nvox, -1);
         D_prev_tick.assign(nvox, 0.0f);
 
         nbr.assign(nvox*6, -1);
@@ -453,6 +466,208 @@ struct World {
     inline int idx(int x, int y, int z) const {
         return (z * p.ny + y) * p.nx + x;
     }
+    void build_component_mask(int label, std::vector<uint8_t>& out) {
+        out.assign(nvox, 0);
+        for (size_t i=0;i<nvox;i++) if (pid_labels[i] == label) out[i] = 1;
+    }
+    double jaccard(const std::vector<uint8_t>& A, const std::vector<uint8_t>& B) {
+        size_t inter=0, uni=0;
+        for (size_t i=0;i<nvox;i++) {
+            uint8_t a=A[i], b=B[i];
+            inter += (a & b);
+            uni   += (a | b);
+        }
+        return (uni>0) ? double(inter)/double(uni) : 0.0;
+    }
+
+    inline void build_pid_mask(float D_q25, float repair_thresh) {
+        for (size_t i = 0; i < nvox; i++) {
+            pid_mask[i] = (curr.D[i] <= D_q25 || repair_delta[i] > repair_thresh) ? 1 : 0;
+        }
+    }
+
+    size_t label_largest_component(int &out_label) {
+        std::fill(pid_labels.begin(), pid_labels.end(), -1);
+
+        int label = 0;
+        size_t best_size = 0;
+        out_label = -1;
+
+        std::vector<size_t> stack;
+        stack.reserve(1024);
+
+        for (size_t i = 0; i < nvox; i++) {
+            if (!pid_mask[i] || pid_labels[i] != -1)
+                continue;
+
+            size_t count = 0;
+            pid_labels[i] = label;
+            stack.clear();
+            stack.push_back(i);
+
+            while (!stack.empty()) {
+                size_t v = stack.back();
+                stack.pop_back();
+                count++;
+
+                for (int d = 0; d < 6; d++) {
+                    int j = nbr[v*6 + d];
+                    if (j < 0) continue;
+                    if (!pid_mask[j]) continue;
+                    if (pid_labels[j] != -1) continue;
+
+                    pid_labels[j] = label;
+                    stack.push_back(j);
+                }
+            }
+
+            if (count > best_size) {
+                best_size = count;
+                out_label = label;
+            }
+
+            label++;
+        }
+
+        return best_size;
+    }
+    int pick_pid_by_overlap(const std::vector<uint8_t>& prev_mask) {
+        // find how many labels exist (label counter is local in label_largest_component)
+        int max_label = -1;
+        for (size_t i=0;i<nvox;i++) if (pid_labels[i] > max_label) max_label = pid_labels[i];
+        if (max_label < 0) return -1;
+
+        int best = -1;
+        double bestJ = -1.0;
+
+        std::vector<uint8_t> cur_mask;
+
+        for (int L=0; L<=max_label; L++) {
+            build_component_mask(L, cur_mask);
+            double J = jaccard(prev_mask, cur_mask);
+            if (J > bestJ) { bestJ = J; best = L; }
+        }
+
+        // Optional: require at least some overlap to avoid latching to nonsense
+        if (bestJ < 0.05) return -1;
+        return best;
+    }
+    struct PIDStats {
+        double D_in = 0, D_b = 0, D_out = 0;
+        double G_b = 0;
+        double cx = 0, cy = 0, cz = 0;
+        size_t Nin = 0, Nb = 0, Nout = 0;
+    };
+
+    PIDStats compute_pid_stats(int pid_label) {
+        PIDStats s;
+
+        for (size_t i = 0; i < nvox; i++) {
+            if (pid_labels[i] != pid_label)
+                continue;
+
+            int x, y, z;
+            idx_to_xyz(i, x, y, z, p);
+
+            bool boundary = false;
+
+            for (int d = 0; d < 6; d++) {
+                int j = nbr[i*6 + d];
+                if (j < 0 || pid_labels[j] != pid_label) {
+                    boundary = true;
+                    break;
+                }
+            }
+
+            if (!boundary) {
+                s.D_in += curr.D[i];
+                s.cx += x;
+                s.cy += y;
+                s.cz += z;
+                s.Nin++;
+            } else {
+                s.D_b += curr.D[i];
+                s.G_b += local_D_gradient(i);
+                s.Nb++;
+
+                // Exterior shell
+                for (int d = 0; d < 6; d++) {
+                    int j = nbr[i*6 + d];
+                    if (j < 0) continue;
+                    if (pid_labels[j] != pid_label) {
+                        s.D_out += curr.D[j];
+                        s.Nout++;
+                    }
+                }
+            }
+        }
+
+        if (s.Nin > 0) {
+            s.D_in /= s.Nin;
+            s.cx /= s.Nin;
+            s.cy /= s.Nin;
+            s.cz /= s.Nin;
+        }
+        if (s.Nb > 0) {
+            s.D_b /= s.Nb;
+            s.G_b /= s.Nb;
+        }
+        if (s.Nout > 0)
+            s.D_out /= s.Nout;
+
+        return s;
+    }
+    double compute_FTP_over_mask(const std::vector<uint8_t>& mask,
+                                const std::vector<uint8_t>& prev,
+                                const std::vector<uint8_t>& curr) {
+        size_t edge_total=0, edge_persist=0;
+        for (size_t i=0;i<nvox;i++) if (mask[i]) {
+            int bits = __builtin_popcount(curr[i]);
+            edge_total += bits;
+            edge_persist += __builtin_popcount(uint8_t(prev[i] & curr[i]));
+        }
+        return (edge_total>0) ? double(edge_persist)/double(edge_total) : 0.0;
+    }
+    void print_pid_recovery_line(
+        const char* phase,
+        size_t PID_size,
+        const PIDStats& ps,
+        double FTP_pid
+    ) {
+        std::cout
+            << "PIDREC "
+            << "tick=" << tick
+            << " phase=" << phase
+            << " size=" << PID_size
+            << " D_in=" << ps.D_in
+            << " D_out=" << ps.D_out
+            << " G_b=" << ps.G_b
+            << " FTP_pid=" << FTP_pid
+            << "\n";
+        }
+    double compute_FTP_pid(
+        const std::vector<uint8_t>& pid_mask,
+        const std::vector<uint8_t>& prev_mask,
+        const std::vector<uint8_t>& curr_mask
+    ) {
+        size_t edge_total = 0;
+        size_t edge_persist = 0;
+
+        for (size_t i = 0; i < nvox; i++) {
+            if (!pid_mask[i]) continue;
+
+            uint8_t p = prev_mask[i];
+            uint8_t c = curr_mask[i];
+
+            int bits = __builtin_popcount(c);
+            edge_total += bits;
+            edge_persist += __builtin_popcount(p & c);
+        }
+
+        if (edge_total == 0) return 0.0;
+        return double(edge_persist) / double(edge_total);
+    }
+
 
     inline bool in_cut_region(int x, int y, int z) const {
         if (!p.enable_cut) return false;
@@ -493,6 +708,51 @@ struct World {
             vh[i] = hash_u64(seed ^ (uint64_t)i);
         }
     }
+    struct AxisCorr {
+        std::vector<double> match;
+        std::vector<uint64_t> count;
+    };
+    AxisCorr compute_axis_correlation(int r_max) {
+        AxisCorr out;
+        out.match.assign(r_max + 1, 0.0);
+        out.count.assign(r_max + 1, 0);
+
+        // Precompute dominant axis for all voxels
+        std::vector<Dir> axis(nvox);
+        for (size_t i = 0; i < nvox; i++) {
+            axis[i] = dominant_axis(i).axis;
+        }
+
+        for (size_t i = 0; i < nvox; i++) {
+            int xi, yi, zi;
+            idx_to_xyz(i, xi, yi, zi, p);
+
+            for (size_t j = i + 1; j < nvox; j++) {
+                int xj, yj, zj;
+                idx_to_xyz(j, xj, yj, zj, p);
+
+                int r = std::abs(xi - xj)
+                    + std::abs(yi - yj)
+                    + std::abs(zi - zj);
+
+                if (r > r_max) continue;
+
+                out.count[r]++;
+                if (axis[i] == axis[j])
+                    out.match[r]++;
+            }
+        }
+
+        return out;
+    }
+    std::vector<double> normalize_axis_corr(const AxisCorr& c) {
+        std::vector<double> C(c.match.size(), 0.0);
+        for (size_t r = 0; r < c.match.size(); r++) {
+            if (c.count[r] > 0)
+                C[r] = c.match[r] / double(c.count[r]);
+        }
+        return C;
+    }   
 
     void append_metrics_csv(
         double BSI,
@@ -801,6 +1061,69 @@ struct World {
         return mask;
     }
 
+    inline void idx_to_xyz(size_t i, int &x, int &y, int &z, const Params &p) {
+    x = int(i % p.nx);
+    y = int((i / p.nx) % p.ny);
+    z = int(i / (p.nx * p.ny));
+}
+
+inline void symmetric_local_scramble(
+    size_t i,
+    uint64_t tick,
+    int radius,
+    int &xo, int &yo, int &zo,
+    const Params &p
+) {
+    int x, y, z;
+    idx_to_xyz(i, x, y, z, p);
+
+    uint64_t h = hash_u64(vh[i] ^ (tick * MIX_TICK) ^ 0x9E3779B97F4A7C15ull);
+
+    int dx = 0, dy = 0, dz = 0;
+    bool found = false;
+
+    constexpr int MAX_TRIES = 32;
+
+    for (int t = 0; t < MAX_TRIES; t++) {
+        // Pull 3 signed bytes from hash stream
+        dx = int(int8_t(h & 0xFF));
+        h >>= 8;
+        dy = int(int8_t(h & 0xFF));
+        h >>= 8;
+        dz = int(int8_t(h & 0xFF));
+        h >>= 8;
+
+        // Scale into radius
+        dx = (dx * radius) / 127;
+        dy = (dy * radius) / 127;
+        dz = (dz * radius) / 127;
+
+        if (dx*dx + dy*dy + dz*dz <= radius * radius) {
+            found = true;
+            break;
+        }
+
+        h = hash_u64(h);
+    }
+
+    // Fallback: deterministic axial hop
+    if (!found) {
+        int r = (int)(h % 6);
+        dx = dy = dz = 0;
+        if (r == 0) dx = radius;
+        if (r == 1) dx = -radius;
+        if (r == 2) dy = radius;
+        if (r == 3) dy = -radius;
+        if (r == 4) dz = radius;
+        if (r == 5) dz = -radius;
+    }
+
+    xo = clampf(x + dx, 0, p.nx - 1);
+    yo = clampf(y + dy, 0, p.ny - 1);
+    zo = clampf(z + dz, 0, p.nz - 1);
+}
+
+
     double compute_RFC(const LagBuffer& buf) {
         int T = buf.R.size();
         if (T < 2) return 0.0;
@@ -1004,7 +1327,7 @@ struct World {
                     for (int x = 0; x < p.nx; x++) {
                         if (!in_cut_region(x,y,z)) continue;
                         size_t i = (size_t)idx(x,y,z);
-                        next.E[i] += p.cut_damage * p.D_ref;
+                        next.D[i] += 0.1;
                     }
                 }
             }
@@ -1232,13 +1555,17 @@ struct World {
                 if (j < 0) return;
                 eligible_repairers++;
 
+                int xs, ys, zs;
+                symmetric_local_scramble(i, tick, 5, xs, ys, zs, p);
+                size_t j_scramble = idx(xs, ys, zs);
+                //float aj = sent[j_scramble];
                 float aj = sent[(size_t)j];
                 max_aj = std::max(max_aj, aj);
                 if (aj > 0.0f) active_repairers++;
                 if (aj <= 0.0f) return;
 
                 // Gate: spiky / rare repair
-                float a_norm = sent[(size_t)j] / (curr.E[(size_t)j] + 1e-6f);
+                float a_norm = aj / (curr.E[(size_t)j] + 1e-6f);
                 a_norm = clampf(a_norm, 0.0f, 4.0f); // allow >1
 
                 int x = int(i % p.nx);
@@ -1247,7 +1574,7 @@ struct World {
 
                 float Dgate = curr.D[i] / (curr.D[i] + 1e-2f); // ~0 when D small, ~1 when D big
 
-                if (sent[(size_t)j] < eff_thresh) return;
+                if (aj < eff_thresh) return;
                 flux_dirs_tick++;   // geometry gate passed
 
                 eligible_active_repairers++;
@@ -1431,6 +1758,7 @@ struct World {
             return tmpD[k];
         };
         float D_q10 = q_at(0.10);
+        float D_q25 = q_at(0.25);
         float D_q50 = q_at(0.50);
         float D_q95 = q_at(0.95);
         float D_q99 = q_at(0.99);
@@ -1677,7 +2005,31 @@ struct World {
 
         topo_mask_prev.swap(topo_mask_curr);
         have_topo_prev = true;
+        // ------------------------
+        // PID RECOVERY METRICS
+        // ------------------------
+        if (tick >= 10000 && baseline_PID_size > 0 && have_topo_prev) {
+            PIDStats ps = compute_pid_stats(tracked_label);
 
+            double FTP_pid = compute_FTP_pid(
+                tracked_pid_prev,
+                topo_mask_prev,
+                topo_mask_curr
+            );
+
+            const char* phase = "BASELINE";
+            if (tick >= p.cut_start_tick && tick < p.cut_end_tick)
+                phase = "PERTURB";
+            else if (tick >= p.cut_end_tick)
+                phase = "RECOVERY";
+
+            print_pid_recovery_line(
+                phase,
+                baseline_PID_size > 0 ? ps.Nin + ps.Nb : 0,
+                ps,
+                FTP_pid
+            );
+        }
         double max_dirs = 4.0 * n;   // 4 perpendicular directions per voxel
 
         double f_flux = (max_dirs > 0)
@@ -1687,6 +2039,54 @@ struct World {
         double f_succ = (flux_dirs_tick > 0)
             ? double(success_dirs_tick) / double(flux_dirs_tick)
             : 0.0;
+
+        // ------------------------
+        // PID Spatial Metrics (GATED)
+        // ------------------------
+        int pid_label = -1;
+        size_t PID_size = 0;
+        PIDStats ps;
+
+        if (tick >= 10000) {
+            build_pid_mask(D_q25, 0.0f);
+            PID_size = label_largest_component(pid_label);
+
+            if (pid_label >= 0)
+                ps = compute_pid_stats(pid_label);
+        }
+
+        build_pid_mask(D_q25, 0.0f);
+        int any_label = -1;
+        label_largest_component(any_label);
+
+        // Choose a PID to track (simplest: largest-at-baseline, once)
+        if (!have_tracked_pid) {
+            tracked_label = any_label;
+            if (tracked_label >= 0) {
+                build_component_mask(tracked_label, tracked_pid_prev);
+                have_tracked_pid = true;
+
+                // record baselines
+                baseline_BSI = compute_BSI(curr.D, D_q50, nbr, nvox);
+                baseline_FTP = FTP;
+                baseline_PID_size = 0; for (auto v: tracked_pid_prev) baseline_PID_size += v;
+
+                PIDStats ps0 = compute_pid_stats(tracked_label);
+                baseline_Din = ps0.D_in;
+                baseline_Dout = ps0.D_out;
+                baseline_Gb = ps0.G_b;
+            }
+        } else {
+            // relabel already done; now choose component that best matches previous tracked mask
+            int new_label = pick_pid_by_overlap(tracked_pid_prev);
+            if (new_label >= 0) {
+                tracked_label = new_label;
+                build_component_mask(tracked_label, tracked_pid_prev);
+            } else {
+                // lost the PID this tick
+                tracked_label = -1;
+            }
+        }
 
         std::cout
             << "tick=" << tick
@@ -1724,6 +2124,14 @@ struct World {
             << " RLI=" << RLI
             << " SPI=" << SPI
             << " FTP=" << FTP
+            << " PID_size=" << PID_size
+            << " D_in=" << ps.D_in
+            << " D_b=" << ps.D_b
+            << " D_out=" << ps.D_out
+            << " G_b=" << ps.G_b
+            << " PID_cx=" << ps.cx
+            << " PID_cy=" << ps.cy
+            << " PID_cz=" << ps.cz
             // << " EMU=" << EMU
             << "\n";
 
