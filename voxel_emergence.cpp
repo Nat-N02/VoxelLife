@@ -2165,7 +2165,7 @@ int main(int argc, char** argv) {
     
     Params p;
 
-    int steps = 1500000002;
+    int steps = 30002;
     uint64_t seed = 15ull;
     
     std::string load_path, save_path;
