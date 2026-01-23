@@ -1,3 +1,5 @@
+This document specifies the formal structure and executable realization of the VRD system. It is not intended to justify or prove the behavioral claims reported in the associated paper, but to define the dynamical object those claims refer to.
+
 [1] Introduced a voxel-based dynamical system 
 
 Lattice: L={0..Nx−1}×{0..Ny−1}×{0..Nz−1}
