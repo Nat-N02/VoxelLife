@@ -1,6 +1,6 @@
 # Grid
-nx = 512
-ny = 512
+nx = 48
+ny = 48
 nz = 3
 
 # Energy
