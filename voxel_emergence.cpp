@@ -2155,6 +2155,7 @@ inline void symmetric_local_scramble(
         D_prev = curr.D;     // vector copy, but only every print_every
         Dm_prev = Dm;
         have_prev_snapshot = true;
+        dump_fields();
     }
 };
 
@@ -2165,7 +2166,7 @@ int main(int argc, char** argv) {
     
     Params p;
 
-    int steps = 30002;
+    int steps = 15002;
     uint64_t seed = 15ull;
     
     std::string load_path, save_path;

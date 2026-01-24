@@ -1,65 +1,67 @@
 import pandas as pd
 import numpy as np
 
-SPI_THRESH = 0.05
+# -------------------------
+# CONFIG
+# -------------------------
+RADIUS = 10
 
-# Bounds (safety rails)
-F_MIN, F_MAX = 0.0, 1.0
-W_MIN, W_MAX = 0.0, 0.01
+TAU_MIN = 0.3
+TAU_MAX = 0.9
+TAU_STEP = 0.005
 
-# Zoom behavior
-F_STEPS = [0.02, 0.01, 0.005]
-W_REL = [0.5, 0.25, 0.1]   # multiplicative zoom
+SIGS = [1, 2, 3, 5, 7]
+EXP_MIN = -5
+EXP_MAX = 0
 
-# Load
-df = pd.read_csv("all_metrics.csv")
+OUTFILE = "refinement_jobs.csv"
 
-R_vals = sorted(df["sent_tail_radius"].unique())
+# -------------------------
+# Generate τ values
+# -------------------------
+taus = np.round(
+    np.arange(TAU_MIN, TAU_MAX + 1e-9, TAU_STEP),
+    6
+)
 
-# Hot points
-hot = df[df["SPI"] >= SPI_THRESH][
-    ["sent_tail_radius", "repair_tail_frac", "W_decay"]
-].drop_duplicates()
+# -------------------------
+# Generate W_decay values (± log grid)
+# -------------------------
+w_vals = set()
 
-refine_set = set()
+for n in range(EXP_MIN, EXP_MAX + 1):
+    for s in SIGS:
+        base = s * (10 ** n)
+        w_vals.add(round(float(base), 8))
+        w_vals.add(round(float(-base), 8))
 
-def clamp(x, lo, hi):
-    return max(lo, min(hi, x))
+# Optional: keep zero explicitly if you want a neutral column
+w_vals.add(0.0)
 
-for _, row in hot.iterrows():
-    r, f, w = row
+# Sort for nice CSV structure
+w_vals = sorted(w_vals)
 
-    # --- Radius (topology only) ---
-    R = [rr for rr in (r-1, r, r+1) if rr >= 1]
+# -------------------------
+# Build sweep
+# -------------------------
+rows = []
+for tau in taus:
+    for w in w_vals:
+        rows.append((RADIUS, tau, w))
 
-    # --- Repair fraction (linear zoom) ---
-    F = {f}
-    for step in F_STEPS:
-        F.add(clamp(f + step, F_MIN, F_MAX))
-        F.add(clamp(f - step, F_MIN, F_MAX))
-
-    # --- W_decay (log-style zoom) ---
-    W = {w}
-    for rel in W_REL:
-        delta = max(w * rel, 1e-6)
-        W.add(clamp(w + delta, W_MIN, W_MAX))
-        W.add(clamp(w - delta, W_MIN, W_MAX))
-
-    # --- Combine ---
-    for rr in R:
-        for ff in F:
-            for ww in W:
-                refine_set.add((
-                    int(rr),
-                    round(float(ff), 6),
-                    round(float(ww), 8)
-                ))
-
-# Save
-out = pd.DataFrame(
-    sorted(refine_set),
+df = pd.DataFrame(
+    rows,
     columns=["sent_tail_radius", "repair_tail_frac", "W_decay"]
 )
 
-out.to_csv("refinement_jobs.csv", index=False)
-print(f"Refinement set size: {len(out)}")
+# -------------------------
+# Save
+# -------------------------
+df.to_csv(OUTFILE, index=False)
+
+print("Sweep generated.")
+print(f"  Radius: {RADIUS}")
+print(f"  τ values: {len(taus)}")
+print(f"  W_decay values: {len(w_vals)}")
+print(f"  Total jobs: {len(df)}")
+print(f"  Output: {OUTFILE}")

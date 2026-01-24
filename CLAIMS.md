@@ -8,7 +8,7 @@ f_flux: fraction of perpendicular directions passing flux gate
 
 FTP: overlap of top-2 outgoing directions per voxel across prints (or your definition)
 
-PROVEN CLAIMS:
+Observed Properties:
 
 1) The system produces persistent, spatially localized domains (PIDs)
  

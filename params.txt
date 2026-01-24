@@ -1,6 +1,6 @@
 # Grid
-nx = 48
-ny = 48
+nx = 512
+ny = 512
 nz = 3
 
 # Energy
@@ -28,8 +28,8 @@ repair_noise = 0.2
 repair_boost_decay = 0.9995
 repair_surface_k = 0.3
 repair_surface_power = 1.2
-repair_tail_frac = 0.75
-sent_tail_radius = 8
+repair_tail_frac = 0.7
+sent_tail_radius = 20
 R_spend_k = 0.01
 
 # Precursor
