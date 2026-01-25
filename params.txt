@@ -47,4 +47,4 @@ repair_cost_activity_k = 1.0
 repair_cost_super_k = 20.0
 
 # Diagnostics
-print_every = 100
+print_every = 1000
