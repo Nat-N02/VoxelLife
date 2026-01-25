@@ -6,12 +6,12 @@ import numpy as np
 # -------------------------
 RADIUS = 10
 
-TAU_MIN = 0.3
-TAU_MAX = 0.9
-TAU_STEP = 0.005
+TAU_MIN = 0.6
+TAU_MAX = 0.8
+TAU_STEP = 0.001
 
-SIGS = [1, 2, 3, 5, 7]
-EXP_MIN = -5
+SIGS = np.logspace(0, 1, num=31)
+EXP_MIN = -2
 EXP_MAX = 0
 
 OUTFILE = "refinement_jobs.csv"
@@ -32,7 +32,6 @@ w_vals = set()
 for n in range(EXP_MIN, EXP_MAX + 1):
     for s in SIGS:
         base = s * (10 ** n)
-        w_vals.add(round(float(base), 8))
         w_vals.add(round(float(-base), 8))
 
 # Optional: keep zero explicitly if you want a neutral column

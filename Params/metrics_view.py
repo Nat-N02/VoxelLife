@@ -3,6 +3,10 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.widgets import RadioButtons
 from matplotlib.widgets import Slider
+from matplotlib.colors import LogNorm
+
+def log_coord(vals):
+    return np.sign(vals) * np.log10(np.abs(vals))
 
 # =========================
 # CONFIG
@@ -26,6 +30,25 @@ METRICS = [
     "sent_q95"
 ]
 VAR_MODES = ["mean", "abs_diff", "std"]
+def make_log_lattice(n_min=-5, n_max=0, mantissas=(1,2,3,5,7)):
+    vals = []
+    for n in range(n_min, n_max + 1):
+        for m in mantissas:
+            v = m * (10 ** n)
+            vals.append(v)
+            vals.append(-v)
+    return np.array(sorted(vals))
+
+W_LATTICE = make_log_lattice()
+def snap_to_lattice(values, lattice, tol=1e-12):
+    snapped = []
+    for v in values:
+        idx = np.argmin(np.abs(lattice - v))
+        if abs(lattice[idx] - v) <= tol:
+            snapped.append(lattice[idx])
+        else:
+            snapped.append(np.nan)
+    return np.array(snapped)
 
 # =========================
 # LOAD & PREP
@@ -47,10 +70,12 @@ fig, ax = plt.subplots(figsize=(8, 6))
 plt.subplots_adjust(right=0.65)
 
 current = {
-    "x": AXIS_PARAMS[0],
-    "y": AXIS_PARAMS[1],
+    "x": "repair_tail_frac",
+    "y": "W_decay",
     "metric": METRICS[0],
-    "mode": "mean"
+    "mode": "mean",
+    "slice_param": "sent_tail_radius",
+    "slice_value": 10
 }
 
 current["slice_param"] = None
@@ -79,6 +104,12 @@ def draw():
     # Filter raw data by slice
     df_slice_raw = raw[raw[slice_param] == current["slice_value"]]
 
+    # Enforce log lattice on W_decay
+    if x == "W_decay" or y == "W_decay" or slice_param == "W_decay":
+        snapped = snap_to_lattice(df_slice_raw["W_decay"].values, W_LATTICE)
+        df_slice_raw = df_slice_raw[~np.isnan(snapped)].copy()
+        df_slice_raw["W_decay"] = snapped[~np.isnan(snapped)]
+
     if current["mode"] == "mean":
         g = df_slice_raw.groupby([x, y])[m].mean().reset_index()
 
@@ -93,21 +124,51 @@ def draw():
     elif current["mode"] == "std":
         g = df_slice_raw.groupby([x, y])[m].std().reset_index()
 
+    g = g.sort_values([y, x])
+
     pivot = g.pivot(index=y, columns=x, values=m)
 
     x_vals = pivot.columns.values.astype(float)
-    y_vals = pivot.index.values.astype(float)
+    y_vals_raw = pivot.index.values.astype(float)
+
+    if y == "W_decay":
+        y_vals = log_coord(y_vals_raw)
+    else:
+        y_vals = y_vals_raw
+
     Z = pivot.values
 
-    im = ax.imshow(
+    # Build grid edges for pcolormesh
+    x_edges = np.unique(x_vals)
+    y_edges = np.unique(y_vals)
+
+    # Expand edges into bin boundaries
+    def edges(vals):
+        d = np.diff(vals) / 2
+        return np.concatenate((
+            [vals[0] - d[0]],
+            vals[:-1] + d,
+            [vals[-1] + d[-1]]
+        ))
+
+    X = edges(x_edges)
+    Y = edges(y_edges)
+
+    # Choose log axis if W_decay is on Y
+    log_y = (y == "W_decay")
+    log_x = (x == "W_decay")
+
+    # Color scaling: log for strictly positive metrics
+    use_lognorm = np.nanmin(Z) > 0
+
+    norm = LogNorm(vmin=np.nanmin(Z), vmax=np.nanmax(Z)) if use_lognorm else None
+
+    im = ax.pcolormesh(
+        X,
+        Y,
         Z,
-        origin="lower",
-        aspect="auto",
-        extent=[
-            x_vals.min(), x_vals.max(),
-            y_vals.min(), y_vals.max()
-        ],
-        interpolation="nearest"
+        shading="auto",
+        norm=norm
     )
 
     ax.set_xlabel(x)

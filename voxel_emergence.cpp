@@ -1,15 +1,3 @@
-// voxel_emergence_opt.cpp
-// Optimized single-thread CPU baseline with:
-// - curr->next only
-// - precomputed neighbors
-// - prehashed voxel IDs for cheap deterministic RNG
-// - persistent scratch arrays
-//
-// Changes included:
-// 1) Damage-dependent global leak (dead matter hemorrhages energy)
-// 2) Repair scarcity: thresholded, gated, efficiency falloff, superlinear cost
-// 3) Expanded diagnostics: variance + percentiles + repair/transport/junction metrics
-
 #include <numeric>
 #include <cstdint>
 #include <vector>
@@ -39,6 +27,8 @@ static inline float lerpf(float a, float b, float t) {
 // Directions (6-neighborhood)
 // ============================================================
 enum Dir : int { XP=0, XN=1, YP=2, YN=3, ZP=4, ZN=5 };
+
+static constexpr int DIRS_2D[4] = { XP, XN, YP, YN };
 
 static inline Dir opposite(Dir d) {
     switch (d) {
@@ -127,7 +117,7 @@ struct Params {
     float repair_surface_power = 1.2f;   // 1 = linear, 2 = harsh
 
     // --- blob splitting (damage wall) ---
-    bool enable_cut = true;
+    bool enable_cut = false;
     int cut_start_tick = 16000;
     int cut_end_tick   = 16100;          // duration ~5000 ticks
     int cut_axis = 1;                    // 0=X, 1=Y, 2=Z
@@ -379,6 +369,13 @@ struct World {
 
     bool have_topR_prev = false;
 
+    // --- PID mobility tracking ---
+    bool have_pid_pos_prev = false;
+    double pid_cx_prev = 0.0, pid_cy_prev = 0.0, pid_cz_prev = 0.0;
+
+    bool have_pid_pos0 = false;
+    double pid_cx0 = 0.0, pid_cy0 = 0.0, pid_cz0 = 0.0;
+
     // --- New gating metrics ---
     uint64_t flux_dirs_tick = 0;     // geometry
     uint64_t econ_dirs_tick = 0;     // geometry + economy
@@ -482,7 +479,11 @@ struct World {
 
     inline void build_pid_mask(float D_q25, float repair_thresh) {
         for (size_t i = 0; i < nvox; i++) {
-            pid_mask[i] = (curr.D[i] <= D_q25 || repair_delta[i] > repair_thresh) ? 1 : 0;
+            if (!in_pid_plane(i)) {
+                pid_mask[i] = 0;
+            } else {
+                pid_mask[i] = (curr.D[i] <= D_q25 || repair_delta[i] > repair_thresh) ? 1 : 0;
+            }
         }
     }
 
@@ -510,7 +511,8 @@ struct World {
                 stack.pop_back();
                 count++;
 
-                for (int d = 0; d < 6; d++) {
+                for (int k = 0; k < 4; k++) {
+                    int d = DIRS_2D[k];
                     int j = nbr[v*6 + d];
                     if (j < 0) continue;
                     if (!pid_mask[j]) continue;
@@ -518,7 +520,7 @@ struct World {
 
                     pid_labels[j] = label;
                     stack.push_back(j);
-                }
+                }   
             }
 
             if (count > best_size) {
@@ -557,7 +559,69 @@ struct World {
         double G_b = 0;
         double cx = 0, cy = 0, cz = 0;
         size_t Nin = 0, Nb = 0, Nout = 0;
+        double cx_mass = 0, cy_mass = 0, cz_mass = 0;
+        size_t Nmass = 0;
     };
+    struct DomainStats {
+        int num_domains = 0;
+        size_t largest = 0;
+        size_t second_largest = 0;
+    };
+    inline bool in_pid_plane(size_t i) const {
+        int x, y, z;
+        idx_to_xyz(i, x, y, z, p);
+        return (z == 1);
+    }
+
+    // Label all components and collect stats
+    DomainStats compute_domain_stats() {
+        DomainStats out;
+
+        std::fill(pid_labels.begin(), pid_labels.end(), -1);
+
+        int label = 0;
+        std::vector<size_t> stack;
+        stack.reserve(1024);
+
+        for (size_t i = 0; i < nvox; i++) {
+            if (!pid_mask[i] || pid_labels[i] != -1)
+                continue;
+
+            size_t count = 0;
+            pid_labels[i] = label;
+            stack.clear();
+            stack.push_back(i);
+
+            while (!stack.empty()) {
+                size_t v = stack.back();
+                stack.pop_back();
+                count++;
+
+                for (int k = 0; k < 4; k++) {
+                    int d = DIRS_2D[k];
+                    int j = nbr[v*6 + d];
+                    if (j < 0) continue;
+                    if (!pid_mask[j]) continue;
+                    if (pid_labels[j] != -1) continue;
+                    pid_labels[j] = label;
+                    stack.push_back(j);
+                }  
+            }
+
+            // update stats
+            out.num_domains++;
+            if (count > out.largest) {
+                out.second_largest = out.largest;
+                out.largest = count;
+            } else if (count > out.second_largest) {
+                out.second_largest = count;
+            }
+
+            label++;
+        }
+
+        return out;
+    }
 
     PIDStats compute_pid_stats(int pid_label) {
         PIDStats s;
@@ -600,6 +664,12 @@ struct World {
                     }
                 }
             }
+            if (pid_labels[i] == pid_label) {
+                s.cx_mass += x;
+                s.cy_mass += y;
+                s.cz_mass += z;
+                s.Nmass++;
+            }
         }
 
         if (s.Nin > 0) {
@@ -614,6 +684,11 @@ struct World {
         }
         if (s.Nout > 0)
             s.D_out /= s.Nout;
+        if (s.Nmass > 0) {
+            s.cx_mass /= s.Nmass;
+            s.cy_mass /= s.Nmass;
+            s.cz_mass /= s.Nmass;
+        }
 
         return s;
     }
@@ -1061,67 +1136,67 @@ struct World {
         return mask;
     }
 
-    inline void idx_to_xyz(size_t i, int &x, int &y, int &z, const Params &p) {
-    x = int(i % p.nx);
-    y = int((i / p.nx) % p.ny);
-    z = int(i / (p.nx * p.ny));
-}
+    static inline void idx_to_xyz(size_t i, int &x, int &y, int &z, const Params &p) {
+        x = int(i % p.nx);
+        y = int((i / p.nx) % p.ny);
+        z = int(i / (p.nx * p.ny));
+    }
 
-inline void symmetric_local_scramble(
-    size_t i,
-    uint64_t tick,
-    int radius,
-    int &xo, int &yo, int &zo,
-    const Params &p
-) {
-    int x, y, z;
-    idx_to_xyz(i, x, y, z, p);
+    inline void symmetric_local_scramble(
+        size_t i,
+        uint64_t tick,
+        int radius,
+        int &xo, int &yo, int &zo,
+        const Params &p
+    ) {
+        int x, y, z;
+        idx_to_xyz(i, x, y, z, p);
 
-    uint64_t h = hash_u64(vh[i] ^ (tick * MIX_TICK) ^ 0x9E3779B97F4A7C15ull);
+        uint64_t h = hash_u64(vh[i] ^ (tick * MIX_TICK) ^ 0x9E3779B97F4A7C15ull);
 
-    int dx = 0, dy = 0, dz = 0;
-    bool found = false;
+        int dx = 0, dy = 0, dz = 0;
+        bool found = false;
 
-    constexpr int MAX_TRIES = 32;
+        constexpr int MAX_TRIES = 32;
 
-    for (int t = 0; t < MAX_TRIES; t++) {
-        // Pull 3 signed bytes from hash stream
-        dx = int(int8_t(h & 0xFF));
-        h >>= 8;
-        dy = int(int8_t(h & 0xFF));
-        h >>= 8;
-        dz = int(int8_t(h & 0xFF));
-        h >>= 8;
+        for (int t = 0; t < MAX_TRIES; t++) {
+            // Pull 3 signed bytes from hash stream
+            dx = int(int8_t(h & 0xFF));
+            h >>= 8;
+            dy = int(int8_t(h & 0xFF));
+            h >>= 8;
+            dz = int(int8_t(h & 0xFF));
+            h >>= 8;
 
-        // Scale into radius
-        dx = (dx * radius) / 127;
-        dy = (dy * radius) / 127;
-        dz = (dz * radius) / 127;
+            // Scale into radius
+            dx = (dx * radius) / 127;
+            dy = (dy * radius) / 127;
+            dz = (dz * radius) / 127;
 
-        if (dx*dx + dy*dy + dz*dz <= radius * radius) {
-            found = true;
-            break;
+            if (dx*dx + dy*dy + dz*dz <= radius * radius) {
+                found = true;
+                break;
+            }
+
+            h = hash_u64(h);
         }
 
-        h = hash_u64(h);
-    }
+        // Fallback: deterministic axial hop
+        if (!found) {
+            int r = (int)(h % 6);
+            dx = dy = dz = 0;
+            if (r == 0) dx = radius;
+            if (r == 1) dx = -radius;
+            if (r == 2) dy = radius;
+            if (r == 3) dy = -radius;
+            if (r == 4) dz = radius;
+            if (r == 5) dz = -radius;
+        }
 
-    // Fallback: deterministic axial hop
-    if (!found) {
-        int r = (int)(h % 6);
-        dx = dy = dz = 0;
-        if (r == 0) dx = radius;
-        if (r == 1) dx = -radius;
-        if (r == 2) dy = radius;
-        if (r == 3) dy = -radius;
-        if (r == 4) dz = radius;
-        if (r == 5) dz = -radius;
+        xo = clampf(x + dx, 0, p.nx - 1);
+        yo = clampf(y + dy, 0, p.ny - 1);
+        zo = clampf(z + dz, 0, p.nz - 1);
     }
-
-    xo = clampf(x + dx, 0, p.nx - 1);
-    yo = clampf(y + dy, 0, p.ny - 1);
-    zo = clampf(z + dz, 0, p.nz - 1);
-}
 
 
     double compute_RFC(const LagBuffer& buf) {
@@ -2087,6 +2162,69 @@ inline void symmetric_local_scramble(
                 tracked_label = -1;
             }
         }
+        PIDStats ps_track;
+        bool track_ok = (have_tracked_pid && tracked_label >= 0);
+
+        if (track_ok) {
+            ps_track = compute_pid_stats(tracked_label);
+            // Guard: if it somehow has no interior/boundary, treat as lost
+            if ((ps_track.Nin + ps_track.Nb) == 0) track_ok = false;
+        }
+        
+
+        // ------------------------
+        // PID Mobility Metrics
+        // ------------------------
+        double PID_speed = 0.0;
+        double PID_msd   = 0.0;
+        int PID_track_ok = track_ok ? 1 : 0;
+
+        if (track_ok) {
+            const double cx = ps_track.cx_mass;
+            const double cy = ps_track.cy_mass;
+            const double cz = ps_track.cz_mass;
+
+            // Baseline centroid (once)
+            if (!have_pid_pos0) {
+                pid_cx0 = cx; pid_cy0 = cy; pid_cz0 = cz;
+                have_pid_pos0 = true;
+            }
+
+            // Speed needs a previous valid point
+            if (!have_pid_pos_prev) {
+                pid_cx_prev = cx; pid_cy_prev = cy; pid_cz_prev = cz;
+                have_pid_pos_prev = true;
+                PID_speed = 0.0; // first valid point: define speed=0
+            } else {
+                const double dx = cx - pid_cx_prev;
+                const double dy = cy - pid_cy_prev;
+                const double dz = cz - pid_cz_prev;
+                PID_speed = std::sqrt(dx*dx + dy*dy + dz*dz);
+
+                pid_cx_prev = cx; pid_cy_prev = cy; pid_cz_prev = cz;
+            }
+
+            // MSD from baseline
+            const double dx0 = cx - pid_cx0;
+            const double dy0 = cy - pid_cy0;
+            const double dz0 = cz - pid_cz0;
+            PID_msd = dx0*dx0 + dy0*dy0 + dz0*dz0;
+        } else {
+            // If you lose the PID, do NOT keep old centroid as "prev"
+            have_pid_pos_prev = false;
+        }
+        int num_domains = 0;
+        size_t largest_domain_size = 0;
+        size_t second_largest_domain_size = 0;
+
+        if (tick >= 10000) {
+            build_pid_mask(D_q25, 0.0f);
+            DomainStats ds = compute_domain_stats();
+            num_domains = ds.num_domains;
+            largest_domain_size = ds.largest;
+            second_largest_domain_size = ds.second_largest;
+        }
+
 
         std::cout
             << "tick=" << tick
@@ -2128,10 +2266,20 @@ inline void symmetric_local_scramble(
             << " D_in=" << ps.D_in
             << " D_b=" << ps.D_b
             << " D_out=" << ps.D_out
+            << " PID_track_ok=" << PID_track_ok
+            << " PID_speed=" << PID_speed
+            << " PID_msd=" << PID_msd
             << " G_b=" << ps.G_b
             << " PID_cx=" << ps.cx
             << " PID_cy=" << ps.cy
             << " PID_cz=" << ps.cz
+            << " PID_cx_mass=" << ps.cx_mass
+            << " PID_cy_mass=" << ps.cy_mass
+            << " PID_cx_core=" << ps.cx
+            << " PID_cy_core=" << ps.cy
+            << " num_domains= " << num_domains
+            << " largest_domain= " << largest_domain_size
+            << " second_domain= " << second_largest_domain_size
             // << " EMU=" << EMU
             << "\n";
 
@@ -2155,6 +2303,7 @@ inline void symmetric_local_scramble(
         D_prev = curr.D;     // vector copy, but only every print_every
         Dm_prev = Dm;
         have_prev_snapshot = true;
+        dump_fields();
     }
 };
 
@@ -2165,7 +2314,7 @@ int main(int argc, char** argv) {
     
     Params p;
 
-    int steps = 15002;
+    int steps = 150000002;
     uint64_t seed = 15ull;
     
     std::string load_path, save_path;

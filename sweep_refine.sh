@@ -7,8 +7,8 @@ set -euo pipefail
 REFINE_LIST="refinement_jobs.csv"
 EXE="./voxel"
 PARAMFILE="params.txt"
-METRICS_DIR="metrics"
-SEEDS=(1 2 3 4 5 6 7 8)
+METRICS_DIR="metrics_claw"
+SEEDS=(1 2 3 4)
 
 MAX_JOBS=16
 DONE_FILE="completed_runs.txt"
