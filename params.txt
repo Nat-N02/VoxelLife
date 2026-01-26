@@ -1,6 +1,6 @@
 # Grid
-nx = 48
-ny = 48
+nx = 256
+ny = 256
 nz = 3
 
 # Energy
@@ -17,7 +17,7 @@ D_to_noise = 0.03
 
 # Weights
 W_floor = 1e-4
-W_decay = 0.2
+W_decay = 0.7
 porous_conduct_floor = 0.01
 porous_noise_boost = 0.5
 
@@ -28,7 +28,7 @@ repair_noise = 0.2
 repair_boost_decay = 0.9995
 repair_surface_k = 0.3
 repair_surface_power = 1.2
-repair_tail_frac = 0.67
+repair_tail_frac = 0.78
 sent_tail_radius = 20
 R_spend_k = 0.01
 
@@ -47,4 +47,4 @@ repair_cost_activity_k = 1.0
 repair_cost_super_k = 20.0
 
 # Diagnostics
-print_every = 1000
+print_every = 100

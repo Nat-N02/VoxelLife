@@ -2303,6 +2303,7 @@ struct World {
         D_prev = curr.D;     // vector copy, but only every print_every
         Dm_prev = Dm;
         have_prev_snapshot = true;
+        dump_fields();
     }
 };
 
