@@ -32,7 +32,7 @@ w_vals = set()
 for n in range(EXP_MIN, EXP_MAX + 1):
     for s in SIGS:
         base = s * (10 ** n)
-        w_vals.add(round(float(-base), 8))
+        w_vals.add(round(float(base), 8))
 
 # Optional: keep zero explicitly if you want a neutral column
 w_vals.add(0.0)
