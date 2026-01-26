@@ -1,8 +1,14 @@
 import sys
+import argparse
 import numpy as np
 import matplotlib.pyplot as plt
+import imageio
+from pathlib import Path
 from matplotlib.widgets import Slider, RadioButtons, TextBox, Button, CheckButtons
 
+# =========================
+# FILE IO
+# =========================
 
 def dump_name(idx):
     return f"dump/dump_t{idx:08d}.bin"
@@ -34,9 +40,11 @@ def load_dump(fname):
         "R_boost": R.reshape(shape),
     }
 
+# =========================
+# VISUALIZER CORE
+# =========================
 
-
-def visualize_time_slices(start_idx=1, step=1):
+def visualize_time_slices(start_idx=1, step=1, export_args=None):
     state = {
         "file_idx": start_idx,
         "step": step,
@@ -44,7 +52,7 @@ def visualize_time_slices(start_idx=1, step=1):
         "field": "E",
         "axis": 0,
         "slice": 0,
-        "lock_scale": False,
+        "lock_scale": True,
         "playing": False,
         "delay_ms": 200,
     }
@@ -52,7 +60,6 @@ def visualize_time_slices(start_idx=1, step=1):
     def load_current():
         fname = dump_name(state["file_idx"])
         state["data"] = load_dump(fname)
-
         dims = [state["data"]["nz"], state["data"]["ny"], state["data"]["nx"]]
         state["slice"] = min(state["slice"], dims[state["axis"]] - 1)
 
@@ -61,7 +68,7 @@ def visualize_time_slices(start_idx=1, step=1):
     fields = ["E", "D", "P", "R_boost"]
     axis_names = ["z", "y", "x"]
 
-    fig, ax = plt.subplots()
+    fig, ax = plt.subplots(figsize=(7, 6))
     plt.subplots_adjust(left=0.3, bottom=0.3)
 
     def get_slice():
@@ -82,7 +89,7 @@ def visualize_time_slices(start_idx=1, step=1):
 
         if state["lock_scale"] and state["field"] in ("E", "D"):
             img.set_clim(0.0, 10.0)
-        elif state["lock_scale"] and state["field"] in ("R_boost"):
+        elif state["lock_scale"] and state["field"] == "R_boost":
             img.set_clim(0.0, 1.0)
         else:
             img.autoscale()
@@ -94,6 +101,54 @@ def visualize_time_slices(start_idx=1, step=1):
         fig.canvas.draw_idle()
 
     refresh()
+
+    # =========================
+    # EXPORT MODE
+    # =========================
+
+    if export_args is not None:
+        out = Path(export_args["out"])
+        out.parent.mkdir(parents=True, exist_ok=True)
+
+        state["field"] = export_args["field"]
+        state["axis"] = axis_names.index(export_args["axis"])
+        state["slice"] = export_args["slice"]
+        state["lock_scale"] = True
+
+        writer = imageio.get_writer(out, fps=export_args["fps"], codec="libx264")
+
+        print("Exporting video to:", out)
+
+        for idx in range(export_args["start"], export_args["end"] + 1, step):
+            try:
+                state["file_idx"] = idx
+                load_current()
+                refresh()
+
+                fig.canvas.draw()
+
+                w, h = fig.canvas.get_width_height()
+                buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+                buf = buf.reshape((h, w, 4))
+
+                # Drop alpha channel (RGBA → RGB)
+                frame = buf[:, :, :3]
+
+                writer.append_data(frame)
+
+
+            except FileNotFoundError:
+                print("Missing file:", dump_name(idx))
+                break
+
+        writer.close()
+        print("Done.")
+        plt.close(fig)
+        return
+
+    # =========================
+    # UI CONTROLS
+    # =========================
 
     ax_slice = plt.axes([0.3, 0.18, 0.6, 0.03])
     slice_slider = Slider(ax_slice, "Slice", 0, state["data"]["nz"] - 1, valinit=0, valstep=1)
@@ -127,7 +182,7 @@ def visualize_time_slices(start_idx=1, step=1):
     radio_axis.on_clicked(on_axis)
 
     ax_scale = plt.axes([0.05, 0.15, 0.2, 0.08])
-    check_scale = CheckButtons(ax_scale, ["Lock scale (E,D)"], [False])
+    check_scale = CheckButtons(ax_scale, ["Lock scale (E,D)"], [True])
 
     def toggle_scale(label):
         state["lock_scale"] = not state["lock_scale"]
@@ -140,13 +195,15 @@ def visualize_time_slices(start_idx=1, step=1):
     btn_prev = Button(ax_prev, "Prev")
     btn_next = Button(ax_next, "Next")
 
+    Trading = lambda d: lambda _: step_time(d)
+
     def step_time(direction):
         state["file_idx"] += direction * state["step"]
         load_current()
         on_axis(axis_names[state["axis"]])
 
-    btn_prev.on_clicked(lambda _: step_time(-1))
-    btn_next.on_clicked(lambda _: step_time(+1))
+    btn_prev.on_clicked(Trading(-1))
+    btn_next.on_clicked(Trading(+1))
 
     ax_step = plt.axes([0.6, 0.08, 0.15, 0.05])
     step_box = TextBox(ax_step, "Δfile", initial=str(step))
@@ -201,6 +258,36 @@ def visualize_time_slices(start_idx=1, step=1):
 
     plt.show()
 
+# =========================
+# CLI
+# =========================
 
 if __name__ == "__main__":
-    visualize_time_slices(start_idx=1, step=int(sys.argv[1]))
+    parser = argparse.ArgumentParser()
+    parser.add_argument("step", type=int, help="file step size")
+    parser.add_argument("--export", nargs=2, metavar=("START", "END"), type=int)
+    parser.add_argument("--field", default="D", choices=["E", "D", "P", "R_boost"])
+    parser.add_argument("--axis", default="z", choices=["x", "y", "z"])
+    parser.add_argument("--slice", type=int, default=0)
+    parser.add_argument("--fps", type=int, default=20)
+    parser.add_argument("--out", default="vrd_export.mp4")
+
+    args = parser.parse_args()
+
+    export_cfg = None
+    if args.export:
+        export_cfg = {
+            "start": args.export[0],
+            "end": args.export[1],
+            "field": args.field,
+            "axis": args.axis,
+            "slice": args.slice,
+            "fps": args.fps,
+            "out": args.out,
+        }
+
+    visualize_time_slices(
+        start_idx=args.export[0] if args.export else 1,
+        step=args.step,
+        export_args=export_cfg
+    )

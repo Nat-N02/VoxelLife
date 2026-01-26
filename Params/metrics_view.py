@@ -39,8 +39,15 @@ def make_log_lattice(n_min=-5, n_max=0, mantissas=(1, 2, 3, 5, 7)):
             vals.append(-v)
     return np.array(sorted(vals), dtype=float)
 
+# W_decay display controls
+W_MAX_ABS = 1.0      # cutoff: keep only -1 <= W_decay <= 1
+W_STRIDE = 2        # keep every Nth lattice value (2 = half density, 3 = third, etc.)
 
-W_LATTICE = make_log_lattice()
+_full_lattice = make_log_lattice()
+
+# Cut to range
+W_LATTICE = _full_lattice[np.abs(_full_lattice) <= W_MAX_ABS]
+
 W_INDEX = {v: i for i, v in enumerate(W_LATTICE)}
 
 
@@ -120,8 +127,7 @@ def value_col_for_axis(axis_name: str) -> str:
 
 def set_w_decay_ticks(a):
     """Pretty tick labels for the W_decay axis when it's categorical positions."""
-    positions = np.arange(len(W_LATTICE))
-    a.set_yticks(positions)
+    a.set_yticks(np.arange(0, len(W_LATTICE), 2))
 
     def fmt(_pos, _):
         # _pos might not be integer due to pan/zoom; only label near integers
