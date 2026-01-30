@@ -140,7 +140,8 @@ struct Params {
     float P0 = 1.0f;            // baseline precursor level
     float P_alpha = 0.005f;    // relaxation rate toward P0
 
-    float P_damage_gain = 0.0f;   // 0 = old behavior, 2–5 is reasonable
+    float P_damage_gain = 0.3f;   // 0 = old behavior, 2–5 is reasonable
+    float p_transfer = 0.005f;
 
     float k_PR = 0.002f;         // conversion rate (k)
     float R_sat = 1.0f;         // saturation scale (RSAT): larger = higher local ceiling
@@ -1358,7 +1359,6 @@ struct World {
 
 
         // clear scratch
-        std::fill(sent.begin(), sent.end(), 0.0f);
         std::fill(sent_dir.begin(), sent_dir.end(), 0.0f);
         std::fill(repair_delta.begin(), repair_delta.end(), 0.0f);
         std::fill(repair_cost.begin(), repair_cost.end(), 0.0f);
@@ -1376,14 +1376,20 @@ struct World {
         for (size_t i = 0; i < nvox; i++) {
             R_boost[i] *= p.repair_boost_decay;
             if (R_boost[i] < 1e-6f) R_boost[i] = 0.0f;
-            // slow relaxation toward baseline
-            float d = clampf(curr.D[i] / p.D_ref, 0.0f, 1.0f);
-
-            // more damage → faster P replenishment
-            float alpha_eff = p.P_alpha * (1.0f + p.P_damage_gain * d);
-
-            next.P[i] += alpha_eff * (p.P0 - curr.P[i]);
+            
+            float P_old = curr.P[i];
+            float P_TARGET = 0.0;
+            if (sent[i] > 1e-6f) {
+                float efficiency = sent[i] / (curr.D[i] + 1e-2f);
+                efficiency = clampf(efficiency, 0.0f, 1000000.0f);
+                P_TARGET = p.P0 * (1.0f + p.P_damage_gain * efficiency / 10.0f);
+            } else {
+                P_TARGET = p.P0;
+            }
+            next.P[i] = P_old + p.P_alpha * (P_TARGET - P_old);
+            
         }
+        std::fill(sent.begin(), sent.end(), 0.0f);
 
         route_energy_curr_to_next();
         update_sent_tail();
@@ -1463,19 +1469,31 @@ struct World {
             }
 
             float delivered = send * loss;
+            bool P_TRANSFER = true;
             E_residual[i] = Ei - send;
+            if (next.P[i] >= delivered * p.p_transfer) next.P[i] -= delivered * p.p_transfer;
+            else P_TRANSFER = false;
 
             sent[i] = send;
             routed_sum_tick += send;
             routed_active_voxels_tick++;
 
             const float* w = &curr.W[i*6];
+            AxisInfo ax = dominant_axis(i);
+
             for (int d = 0; d < 6; d++) {
                 float frac = w[d];
                 sent_dir[i*6 + d] = send * frac;
 
                 int j = nbr[i*6 + d];
-                if (j >= 0) next.E[(size_t)j] += delivered * frac;
+                if (j < 0) continue;
+
+                float flow = delivered * frac;
+                next.E[(size_t)j] += flow;
+
+                if (d == ax.fwd) {
+                    next.P[(size_t)j] += flow * p.p_transfer;
+                }
             }
         }
     }
@@ -1806,7 +1824,7 @@ struct World {
                 corr_den_prev += dp * dp;
             }
         }
-
+        
         double v_all=0, v_rep=0, v_nrep=0;
         size_t n_all=0, n_rep=0, n_nrep=0;
 
@@ -2303,6 +2321,7 @@ struct World {
         D_prev = curr.D;     // vector copy, but only every print_every
         Dm_prev = Dm;
         have_prev_snapshot = true;
+        dump_fields();
     }
 };
 
@@ -2313,7 +2332,7 @@ int main(int argc, char** argv) {
     
     Params p;
 
-    int steps = 15002;
+    int steps = 150000002;
     uint64_t seed = 15ull;
     
     std::string load_path, save_path;
