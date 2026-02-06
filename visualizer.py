@@ -146,6 +146,7 @@ def load_dump(fname):
         D = np.fromfile(f, dtype="<f4", count=nvox)
         P = np.fromfile(f, dtype="<f4", count=nvox)
         R = np.fromfile(f, dtype="<f4", count=nvox)
+        C = np.fromfile(f, dtype="<f4", count=nvox)
 
     shape = (nz, ny, nx)  # z, y, x
     return {
@@ -157,6 +158,7 @@ def load_dump(fname):
         "D": D.reshape(shape),
         "P": P.reshape(shape),
         "R_boost": R.reshape(shape),
+        "C": C.reshape(shape),
     }
 
 # =========================
@@ -190,7 +192,7 @@ def visualize_time_slices(start_idx=1, step=1, export_args=None):
 
     load_current()
 
-    fields = ["E", "D", "P", "R_boost", "PID_mask", "Components", "Fire", "Hoard"]
+    fields = ["E", "D", "P", "R_boost", "C", "PID_mask", "Components", "Fire", "Hoard"]
     axis_names = ["z", "y", "x"]
 
     fig, ax = plt.subplots(figsize=(7, 6))
@@ -203,6 +205,7 @@ def visualize_time_slices(start_idx=1, step=1, export_args=None):
         D = data["D"]
         P = data["P"]
         R = data["R_boost"]
+        C = data["C"]
 
         if field == "PID_mask":
             mask, _ = pid_mask_from_D(D, state["pid_q"])

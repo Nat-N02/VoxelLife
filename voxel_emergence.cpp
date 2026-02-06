@@ -360,6 +360,8 @@ struct World {
     std::vector<uint8_t> pid_mask;
     std::vector<int> pid_labels;
     std::vector<uint8_t> tracked_pid_prev;   // 1 if voxel in PID at baseline
+    std::vector<int> pid_labels_domains;
+    bool pid_memory_cleared = false;
     bool have_tracked_pid = false;
     int tracked_label = -1;
     double baseline_PID_size = 0;
@@ -369,6 +371,23 @@ struct World {
     uint64_t perturb_tick = 0;
 
     bool have_topR_prev = false;
+    
+    // --- Closure metrics ---
+    std::vector<float> pid_flux_hist;
+    std::vector<float> pid_repair_hist;
+    std::vector<float> pid_struct_hist;
+
+    int closure_lag = 4;
+
+    // CGI
+    double cgi_accum = 0.0;
+    int cgi_count = 0;
+
+    // Freeze test
+    bool freeze_W = false;
+    uint64_t freeze_start = 0;
+    uint64_t freeze_end = 0;
+
 
     // --- PID mobility tracking ---
     bool have_pid_pos_prev = false;
@@ -376,6 +395,14 @@ struct World {
 
     bool have_pid_pos0 = false;
     double pid_cx0 = 0.0, pid_cy0 = 0.0, pid_cz0 = 0.0;
+    // --- Spatial probe logging ---
+    std::ofstream probe_out;
+    bool probe_open = false;
+    int probe_cx = 136;
+    int probe_cy = 128;
+    int probe_cz = 1;
+    int probe_r  = 4;   // radius -> 9x9 window
+    std::string probe_path = "probe_136_128.csv";
 
     // --- New gating metrics ---
     uint64_t flux_dirs_tick = 0;     // geometry
@@ -428,7 +455,7 @@ struct World {
         nvox = static_cast<size_t>(p.nx) * p.ny * p.nz;
         curr.resize(nvox);
         next.resize(nvox);
-
+        pid_labels_domains.assign(nvox, -1);
         sent.assign(nvox, 0.0f);
         sent_dir.assign(nvox*6, 0.0f);
         repair_delta.assign(nvox, 0.0f);
@@ -441,7 +468,7 @@ struct World {
         top10_prev.resize(nvox, 0);
         top1_age.assign(nvox, 0);
         top5_age.assign(nvox, 0);
-        sent_tail_local.assign(nvox, 1e-6f);    
+        sent_tail_local.assign(nvox, 0.5f);    
         tmpX.assign(nvox, 0.0f);
         tmpY.assign(nvox, 0.0f);
         fossil_C.assign(nvox, 0);
@@ -452,6 +479,9 @@ struct World {
         pid_mask.assign(nvox, 0);
         pid_labels.assign(nvox, -1);
         D_prev_tick.assign(nvox, 0.0f);
+        pid_flux_hist.reserve(64);
+        pid_repair_hist.reserve(64);
+        pid_struct_hist.reserve(64);
 
         nbr.assign(nvox*6, -1);
         vh.assign(nvox, 0);
@@ -466,8 +496,13 @@ struct World {
     }
     void build_component_mask(int label, std::vector<uint8_t>& out) {
         out.assign(nvox, 0);
-        for (size_t i=0;i<nvox;i++) if (pid_labels[i] == label) out[i] = 1;
+        if (label < 0) return;                 // <-- CRITICAL GUARD
+
+        for (size_t i=0;i<nvox;i++)
+            if (pid_labels[i] == label && in_pid_plane(i))
+                out[i] = 1;
     }
+
     double jaccard(const std::vector<uint8_t>& A, const std::vector<uint8_t>& B) {
         size_t inter=0, uni=0;
         for (size_t i=0;i<nvox;i++) {
@@ -478,12 +513,12 @@ struct World {
         return (uni>0) ? double(inter)/double(uni) : 0.0;
     }
 
-    inline void build_pid_mask(float D_q25, float repair_thresh) {
+    inline void build_pid_mask(float D_thresh) {
         for (size_t i = 0; i < nvox; i++) {
             if (!in_pid_plane(i)) {
                 pid_mask[i] = 0;
             } else {
-                pid_mask[i] = (curr.D[i] <= D_q25 || repair_delta[i] > repair_thresh) ? 1 : 0;
+                pid_mask[i] = (curr.D[i] <= D_thresh) ? 1 : 0;
             }
         }
     }
@@ -499,7 +534,7 @@ struct World {
         stack.reserve(1024);
 
         for (size_t i = 0; i < nvox; i++) {
-            if (!pid_mask[i] || pid_labels[i] != -1)
+            if (!pid_mask[i] || pid_labels[i] != -1 || !in_pid_plane(i))
                 continue;
 
             size_t count = 0;
@@ -516,8 +551,8 @@ struct World {
                     int d = DIRS_2D[k];
                     int j = nbr[v*6 + d];
                     if (j < 0) continue;
-                    if (!pid_mask[j]) continue;
                     if (pid_labels[j] != -1) continue;
+                    if (!pid_mask[j] || !in_pid_plane(j)) continue;
 
                     pid_labels[j] = label;
                     stack.push_back(j);
@@ -573,23 +608,52 @@ struct World {
         idx_to_xyz(i, x, y, z, p);
         return (z == 1);
     }
+    void clear_pid_tracking_memory() {
+        have_tracked_pid = false;
+        tracked_label = -1;
+
+        std::fill(tracked_pid_prev.begin(), tracked_pid_prev.end(), 0);
+
+        have_pid_pos_prev = false;
+        have_pid_pos0 = false;
+
+        baseline_PID_size = 0;
+        baseline_BSI = 0;
+        baseline_FTP = 0;
+        baseline_Din = 0;
+        baseline_Dout = 0;
+        baseline_Gb = 0;
+
+        pid_flux_hist.clear();
+        pid_repair_hist.clear();
+        pid_struct_hist.clear();
+
+        cgi_accum = 0.0;
+        cgi_count = 0;
+
+        have_topR_prev = false;
+        have_topo_prev = false;
+        have_top_prev = false;
+
+        std::cout << "PID MEMORY CLEARED at tick=" << tick << "\n";
+    }
 
     // Label all components and collect stats
     DomainStats compute_domain_stats() {
         DomainStats out;
 
-        std::fill(pid_labels.begin(), pid_labels.end(), -1);
+        std::fill(pid_labels_domains.begin(), pid_labels_domains.end(), -1);
 
         int label = 0;
         std::vector<size_t> stack;
         stack.reserve(1024);
 
         for (size_t i = 0; i < nvox; i++) {
-            if (!pid_mask[i] || pid_labels[i] != -1)
+            if (!pid_mask[i] || pid_labels_domains[i] != -1 || !in_pid_plane(i))
                 continue;
 
             size_t count = 0;
-            pid_labels[i] = label;
+            pid_labels_domains[i] = label;
             stack.clear();
             stack.push_back(i);
 
@@ -602,9 +666,9 @@ struct World {
                     int d = DIRS_2D[k];
                     int j = nbr[v*6 + d];
                     if (j < 0) continue;
-                    if (!pid_mask[j]) continue;
-                    if (pid_labels[j] != -1) continue;
-                    pid_labels[j] = label;
+                    if (!pid_mask[j] || !in_pid_plane(j)) continue;
+                    if (pid_labels_domains[j] != -1) continue;
+                    pid_labels_domains[j] = label;
                     stack.push_back(j);
                 }  
             }
@@ -626,9 +690,10 @@ struct World {
 
     PIDStats compute_pid_stats(int pid_label) {
         PIDStats s;
+        if (pid_label < 0) return s;
 
         for (size_t i = 0; i < nvox; i++) {
-            if (pid_labels[i] != pid_label)
+            if (pid_labels[i] != pid_label || !in_pid_plane(i))
                 continue;
 
             int x, y, z;
@@ -636,9 +701,11 @@ struct World {
 
             bool boundary = false;
 
-            for (int d = 0; d < 6; d++) {
+            // Only 2D boundary for plane domains
+            for (int kk = 0; kk < 4; kk++) {
+                int d = DIRS_2D[kk];
                 int j = nbr[i*6 + d];
-                if (j < 0 || pid_labels[j] != pid_label) {
+                if (j < 0 || !in_pid_plane(j) || pid_labels[j] != pid_label) {
                     boundary = true;
                     break;
                 }
@@ -659,8 +726,9 @@ struct World {
                 for (int d = 0; d < 6; d++) {
                     int j = nbr[i*6 + d];
                     if (j < 0) continue;
+                    if (!in_pid_plane((size_t)j)) continue;   // <-- keep all PID stats in z==1
                     if (pid_labels[j] != pid_label) {
-                        s.D_out += curr.D[j];
+                        s.D_out += curr.D[(size_t)j];
                         s.Nout++;
                     }
                 }
@@ -693,6 +761,57 @@ struct World {
 
         return s;
     }
+    void open_probe() {
+        if (probe_open) return;
+        probe_out.open(probe_path, std::ios::out);
+        if (!probe_out) {
+            std::cerr << "Failed to open probe log: " << probe_path << "\n";
+            return;
+        }
+
+        // Header
+        probe_out
+            << "tick,x,y,z,"
+            << "sent,R_boost,D,P,E,sent_tail\n";
+        probe_open = true;
+    }
+
+    void close_probe() {
+        if (probe_open) {
+            probe_out.close();
+            probe_open = false;
+        }
+    }
+    void log_probe_window() {
+        if (!probe_open) open_probe();
+        if (!probe_open) return;
+
+        int x0 = std::max(0, probe_cx - probe_r);
+        int x1 = std::min(p.nx - 1, probe_cx + probe_r);
+        int y0 = std::max(0, probe_cy - probe_r);
+        int y1 = std::min(p.ny - 1, probe_cy + probe_r);
+        int z  = probe_cz;
+
+        for (int y = y0; y <= y1; y++) {
+            for (int x = x0; x <= x1; x++) {
+                size_t i = idx(x, y, z);
+
+                probe_out
+                    << tick << ","
+                    << x << ","
+                    << y << ","
+                    << z << ","
+                    << sent[i] << ","
+                    << R_boost[i] << ","
+                    << curr.D[i] << ","
+                    << curr.P[i] << ","
+                    << curr.E[i] << ","
+                    << sent_tail_local[i]
+                    << "\n";
+            }
+        }
+    }
+
     double compute_FTP_over_mask(const std::vector<uint8_t>& mask,
                                 const std::vector<uint8_t>& prev,
                                 const std::vector<uint8_t>& curr) {
@@ -829,6 +948,26 @@ struct World {
         }
         return C;
     }   
+    double compute_LCCI()
+    {
+        if ((int)pid_struct_hist.size() <= closure_lag + 2)
+            return 0.0;
+
+        std::vector<float> S, FR;
+        for (size_t i = closure_lag; i < pid_struct_hist.size(); i++) {
+            float f = pid_flux_hist[i - closure_lag];
+            float r = pid_repair_hist[i];
+            FR.push_back(f * r);
+            S.push_back(pid_struct_hist[i]);
+        }
+        return spearman(S, FR);
+    }
+    void start_freeze(uint64_t dur)
+    {
+        freeze_W = true;
+        freeze_start = tick;
+        freeze_end = tick + dur;
+    }
 
     void append_metrics_csv(
         double BSI,
@@ -1028,6 +1167,12 @@ struct World {
         repair_delta.assign(nvox, 0.0f);
         repair_cost.assign(nvox, 0.0f);
 
+        have_tracked_pid = false;
+        tracked_label = -1;
+        tracked_pid_prev.assign(nvox, 0);
+        have_pid_pos_prev = false;
+        have_pid_pos0 = false;
+
         return (bool)is;
     }
 
@@ -1059,6 +1204,90 @@ struct World {
         std::fwrite(R_boost.data(), sizeof(float), nvox, f);
 
         std::fclose(f);
+    }
+
+        static double spearman(const std::vector<float>& a,
+                        const std::vector<float>& b)
+    {
+        size_t n = std::min(a.size(), b.size());
+        if (n < 4) return 0.0;
+
+        std::vector<size_t> ra(n), rb(n);
+        std::iota(ra.begin(), ra.end(), 0);
+        std::iota(rb.begin(), rb.end(), 0);
+
+        std::sort(ra.begin(), ra.end(),
+            [&](size_t i, size_t j){ return a[i] < a[j]; });
+        std::sort(rb.begin(), rb.end(),
+            [&](size_t i, size_t j){ return b[i] < b[j]; });
+
+        std::vector<double> R(n), S(n);
+        for (size_t i = 0; i < n; i++) {
+            R[ra[i]] = double(i);
+            S[rb[i]] = double(i);
+        }
+
+        double mr = 0, ms = 0;
+        for (size_t i = 0; i < n; i++) {
+            mr += R[i];
+            ms += S[i];
+        }
+        mr /= n; ms /= n;
+
+        double num = 0, dr = 0, ds = 0;
+        for (size_t i = 0; i < n; i++) {
+            double x = R[i] - mr;
+            double y = S[i] - ms;
+            num += x * y;
+            dr += x * x;
+            ds += y * y;
+        }
+
+        if (dr == 0 || ds == 0) return 0.0;
+        return num / std::sqrt(dr * ds);
+    }
+
+    void sample_pid_signals()
+    {
+        if (!have_tracked_pid || tracked_label < 0) return;
+
+        float F = 0.0f;
+        float R = 0.0f;
+        float S = 0.0f;
+        int n = 0;
+
+        for (size_t i = 0; i < nvox; i++) {
+            if (!tracked_pid_prev[i] || !in_pid_plane(i)) continue;
+
+            F += sent[i];
+            R += repair_delta[i];
+            S += __builtin_popcount(build_topo_mask(i, 2));
+            n++;
+        }
+
+        if (n == 0) return;
+
+        pid_flux_hist.push_back(F / n);
+        pid_repair_hist.push_back(R / n);
+        pid_struct_hist.push_back(S / n);
+
+        if ((int)pid_flux_hist.size() > closure_lag + 8) {
+            pid_flux_hist.erase(pid_flux_hist.begin());
+            pid_repair_hist.erase(pid_repair_hist.begin());
+            pid_struct_hist.erase(pid_struct_hist.begin());
+        }
+    }
+    double compute_pid_rfc()
+    {
+        if ((int)pid_flux_hist.size() <= closure_lag + 2)
+            return 0.0;
+
+        std::vector<float> F, R;
+        for (size_t i = closure_lag; i < pid_flux_hist.size(); i++) {
+            F.push_back(pid_flux_hist[i - closure_lag]);
+            R.push_back(pid_repair_hist[i]);
+        }
+        return spearman(F, R);
     }
 
     double compute_BSI(const std::vector<float>& D,
@@ -1357,7 +1586,6 @@ struct World {
         econ_dirs_tick = 0;
         success_dirs_tick = 0;
 
-
         // clear scratch
         std::fill(sent_dir.begin(), sent_dir.end(), 0.0f);
         std::fill(repair_delta.begin(), repair_delta.end(), 0.0f);
@@ -1390,6 +1618,10 @@ struct World {
             
         }
         std::fill(sent.begin(), sent.end(), 0.0f);
+
+        if (tick == 10000301) start_freeze(1000);
+        if (freeze_W && tick >= freeze_end)
+            freeze_W = false;
 
         route_energy_curr_to_next();
         update_sent_tail();
@@ -1438,6 +1670,7 @@ struct World {
         std::swap(curr.D, next.D);
         std::swap(curr.W, next.W);
         std::swap(curr.P, next.P);
+        log_probe_window();
 
         tick++;
     }
@@ -1551,45 +1784,30 @@ struct World {
         }
     }
 
-    void compute_sent_local_max_box(int r, std::vector<float>& out_local_max) {
-        out_local_max.assign(nvox, 0.0f);
+    void compute_sent_local_max_radial(int r, std::vector<float>& out)
+    {
+        out.assign(nvox, 0.0f);
 
-        // Shortcut: if radius covers entire grid, local max == global max everywhere
-        int Rneed = std::max({p.nx-1, p.ny-1, p.nz-1});
-        if (r >= Rneed) {
-            float gmax = 0.0f;
-            for (size_t i=0; i<nvox; i++) gmax = std::max(gmax, sent[i]);
-            std::fill(out_local_max.begin(), out_local_max.end(), gmax);
-            return;
-        }
+        // Initialize with sent
+        for (size_t i = 0; i < nvox; i++)
+            out[i] = sent[i];
 
-        // Pass 1: X lines
-        for (int z=0; z<p.nz; z++) {
-            for (int y=0; y<p.ny; y++) {
-                const float* line = &sent[(z*p.ny + y)*p.nx];
-                float* out = &tmpX[(z*p.ny + y)*p.nx];
-                sliding_max_1d_padded(line, p.nx, r, out);
-            }
-        }
+        std::vector<float> tmp(nvox);
 
-        // Pass 2: Y lines
-        std::vector<float> inY(p.ny), outY(p.ny);
-        for (int z=0; z<p.nz; z++) {
-            for (int x=0; x<p.nx; x++) {
-                // gather line along y
-                for (int y=0; y<p.ny; y++) inY[y] = tmpX[idx(x,y,z)];
-                sliding_max_1d_padded(inY.data(), p.ny, r, outY.data());
-                for (int y=0; y<p.ny; y++) tmpY[idx(x,y,z)] = outY[y];
-            }
-        }
+        for (int step = 0; step < r; step++) {
+            tmp = out;
 
-        // Pass 3: Z lines
-        std::vector<float> inZ(p.nz), outZ(p.nz);
-        for (int y=0; y<p.ny; y++) {
-            for (int x=0; x<p.nx; x++) {
-                for (int z=0; z<p.nz; z++) inZ[z] = tmpY[idx(x,y,z)];
-                sliding_max_1d_padded(inZ.data(), p.nz, r, outZ.data());
-                for (int z=0; z<p.nz; z++) out_local_max[idx(x,y,z)] = outZ[z];
+            for (size_t i = 0; i < nvox; i++) {
+                float best = tmp[i];
+
+                for (int d = 0; d < 6; d++) {
+                    int j = nbr[i*6 + d];
+                    if (j >= 0) {
+                        best = std::max(best, tmp[j]);
+                    }
+                }
+
+                out[i] = best;
             }
         }
     }
@@ -1597,7 +1815,7 @@ struct World {
     void update_sent_tail() {
         static std::vector<float> local_max; // reuse
         int radius = p.sent_tail_radius;
-        compute_sent_local_max_box(radius, local_max);
+        compute_sent_local_max_radial(radius, local_max);
 
         for (size_t i=0; i<nvox; i++) {
             float lm = local_max[i];
@@ -1624,6 +1842,7 @@ struct World {
     // --------------------------------------------------------
     void apply_perpendicular_repair() {
         uint64_t active_repairers=0, eligible_repairers=0, eligible_active_repairers=0;
+        if (tick <= 100010 && tick >= 100000) return;
 
         float max_aj = 0.0f;
 
@@ -1745,6 +1964,11 @@ struct World {
     // WEIGHTS: evolve curr.W -> next.W (decay toward uniform + damage-linked noise)
     // --------------------------------------------------------
     void evolve_weights_curr_to_next() {
+        if (freeze_W) {
+            for (size_t i = 0; i < nvox*6; i++)
+                next.W[i] = curr.W[i];
+            return;
+        }
         for (size_t i = 0; i < nvox; i++) {
             float D = curr.D[i];
             float x = D / p.D_ref;
@@ -1855,6 +2079,22 @@ struct World {
         float D_q50 = q_at(0.50);
         float D_q95 = q_at(0.95);
         float D_q99 = q_at(0.99);
+        // Percentiles of D on z==1 only
+        std::vector<float> Dz1;
+        Dz1.reserve(nvox / p.nz);
+        for (size_t i = 0; i < nvox; i++) {
+            if (in_pid_plane(i)) Dz1.push_back(curr.D[i]);
+        }
+
+        auto qz1_at = [&](double q)->float {
+            if (Dz1.empty()) return 0.0f;
+            size_t k = (size_t)std::floor(q * double(Dz1.size() - 1));
+            std::nth_element(Dz1.begin(), Dz1.begin() + k, Dz1.end());
+            return Dz1[k];
+        };
+
+        float D_q25_z1 = qz1_at(0.25f);
+        float D_q50_z1 = qz1_at(0.50f);
 
         std::vector<float> tmpS(sent.begin(), sent.end());
 
@@ -2098,6 +2338,78 @@ struct World {
 
         topo_mask_prev.swap(topo_mask_curr);
         have_topo_prev = true;
+        double max_dirs = 4.0 * n;   // 4 perpendicular directions per voxel
+
+        double f_flux = (max_dirs > 0)
+            ? double(flux_dirs_tick) / max_dirs
+            : 0.0;
+
+        double f_succ = (flux_dirs_tick > 0)
+            ? double(success_dirs_tick) / double(flux_dirs_tick)
+            : 0.0;
+
+        // ------------------------
+        // PID Spatial Metrics + Tracking (REAL)
+        // ------------------------
+        int any_label = -1;
+        size_t any_size = 0;
+
+        // Build mask on z==1 using z==1 quantile
+        build_pid_mask(D_q25_z1);
+
+        // Label components in pid_mask; pid_labels now valid for this tick
+        any_size = label_largest_component(any_label);
+
+        // Track / update
+        if (!have_tracked_pid) {
+            // Acquire: just take the largest component on the first valid tick
+            if (any_label >= 0 && any_size > 0) {
+                tracked_label = any_label;
+                build_component_mask(tracked_label, tracked_pid_prev);
+                have_tracked_pid = true;
+
+                // Baselines (optional, if you still want them)
+                baseline_BSI = compute_BSI(curr.D, D_q50, nbr, nvox);
+                baseline_FTP = FTP;
+                baseline_PID_size = 0;
+                for (auto v : tracked_pid_prev) baseline_PID_size += v;
+
+                PIDStats ps0 = compute_pid_stats(tracked_label);
+                baseline_Din = ps0.D_in;
+                baseline_Dout = ps0.D_out;
+                baseline_Gb = ps0.G_b;
+
+                // reset mobility baseline
+                have_pid_pos_prev = false;
+                have_pid_pos0 = false;
+            } else {
+                tracked_label = -1;
+            }
+        } else {
+            // Update: choose the component with best overlap vs last tick
+            int new_label = pick_pid_by_overlap(tracked_pid_prev);
+
+            if (new_label < 0) {
+                // LOST TRACKING
+                have_tracked_pid = false;
+                tracked_label = -1;
+                tracked_pid_prev.assign(nvox, 0);
+                have_pid_pos_prev = false;
+                have_pid_pos0 = false;
+            } else {
+                // SUCCESSFUL TRACKING UPDATE
+                tracked_label = new_label;
+                build_component_mask(tracked_label, tracked_pid_prev);
+            }
+        }
+
+        // For printing "PID_size" (tracked component size)
+        size_t PID_size = 0;
+        PIDStats ps;
+        if (have_tracked_pid && tracked_label >= 0) {
+            ps = compute_pid_stats(tracked_label);
+            PID_size = ps.Nin + ps.Nb;
+        }
         // ------------------------
         // PID RECOVERY METRICS
         // ------------------------
@@ -2122,63 +2434,6 @@ struct World {
                 ps,
                 FTP_pid
             );
-        }
-        double max_dirs = 4.0 * n;   // 4 perpendicular directions per voxel
-
-        double f_flux = (max_dirs > 0)
-            ? double(flux_dirs_tick) / max_dirs
-            : 0.0;
-
-        double f_succ = (flux_dirs_tick > 0)
-            ? double(success_dirs_tick) / double(flux_dirs_tick)
-            : 0.0;
-
-        // ------------------------
-        // PID Spatial Metrics (GATED)
-        // ------------------------
-        int pid_label = -1;
-        size_t PID_size = 0;
-        PIDStats ps;
-
-        if (tick >= 10000) {
-            build_pid_mask(D_q25, 0.0f);
-            PID_size = label_largest_component(pid_label);
-
-            if (pid_label >= 0)
-                ps = compute_pid_stats(pid_label);
-        }
-
-        build_pid_mask(D_q25, 0.0f);
-        int any_label = -1;
-        label_largest_component(any_label);
-
-        // Choose a PID to track (simplest: largest-at-baseline, once)
-        if (!have_tracked_pid) {
-            tracked_label = any_label;
-            if (tracked_label >= 0) {
-                build_component_mask(tracked_label, tracked_pid_prev);
-                have_tracked_pid = true;
-
-                // record baselines
-                baseline_BSI = compute_BSI(curr.D, D_q50, nbr, nvox);
-                baseline_FTP = FTP;
-                baseline_PID_size = 0; for (auto v: tracked_pid_prev) baseline_PID_size += v;
-
-                PIDStats ps0 = compute_pid_stats(tracked_label);
-                baseline_Din = ps0.D_in;
-                baseline_Dout = ps0.D_out;
-                baseline_Gb = ps0.G_b;
-            }
-        } else {
-            // relabel already done; now choose component that best matches previous tracked mask
-            int new_label = pick_pid_by_overlap(tracked_pid_prev);
-            if (new_label >= 0) {
-                tracked_label = new_label;
-                build_component_mask(tracked_label, tracked_pid_prev);
-            } else {
-                // lost the PID this tick
-                tracked_label = -1;
-            }
         }
         PIDStats ps_track;
         bool track_ok = (have_tracked_pid && tracked_label >= 0);
@@ -2236,14 +2491,27 @@ struct World {
         size_t second_largest_domain_size = 0;
 
         if (tick >= 10000) {
-            build_pid_mask(D_q25, 0.0f);
             DomainStats ds = compute_domain_stats();
             num_domains = ds.num_domains;
             largest_domain_size = ds.largest;
             second_largest_domain_size = ds.second_largest;
         }
-
-
+        // --- CGI ---
+        if (track_ok) {
+            double dFTP = FTP - baseline_FTP;
+            for (size_t i = 0; i < nvox; i++) {
+                if (tracked_pid_prev[i] && repair_delta[i] > 0.0f) {
+                    cgi_accum += dFTP;
+                    cgi_count++;
+                }
+            }
+        }
+        double CGI = (cgi_count > 0) ? (cgi_accum / cgi_count) : 0.0;
+        size_t pid_plane_count = 0;
+        for (size_t i=0;i<nvox;i++)
+            if (pid_mask[i] && in_pid_plane(i))
+                pid_plane_count++;
+        
         std::cout
             << "tick=" << tick
             << " E_sum=" << std::fixed << std::setprecision(3) << Es
@@ -2255,25 +2523,13 @@ struct World {
             << " Rmax=" << Rmax
             << " Smax=" << Smax
             << " VarD=" << VarD
-            //<< " D_q50=" << D_q50
             << " D_q95=" << D_q95
             << " D_q99=" << D_q99
-            //<< " ov1=" << ov1
-            //<< " ov5=" << ov5
-            //<< " ov10=" << ov10
-            //<< " age1_mean=" << mean1
-            //<< " age1_max=" << max1
-            //<< " age5_mean=" << mean5
-            //<< " age5_max=" << max5
-            //<< " Var_dD=" << v_all
-            //<< " Var_dD_rep=" << v_rep
-            //<< " Var_dD_nrep=" << v_nrep
             << " mean_flux=" << mean_flux
             << " flux/storage=" << flux_to_storage
             << " repair_events=" << repair_events_tick
             << " f_flux=" << f_flux
             << " f_succ=" << f_succ
-            //<< " junction_density=" << junction_density
             << " BSI=" << BSI
             << " RFC=" << RFC
             << " RGI=" << RGI
@@ -2298,7 +2554,9 @@ struct World {
             << " num_domains= " << num_domains
             << " largest_domain= " << largest_domain_size
             << " second_domain= " << second_largest_domain_size
-            // << " EMU=" << EMU
+            << " PID_RFC=" << compute_pid_rfc()
+            << " CGI=" << CGI
+            << " LCCI=" << compute_LCCI()
             << "\n";
 
         // ------------------------
