@@ -28,8 +28,8 @@ repair_noise = 0.2
 repair_boost_decay = 0.9995
 repair_surface_k = 0.3
 repair_surface_power = 1.2
-repair_tail_frac = 0.75
-sent_tail_radius = 20
+repair_tail_frac = 0.72
+sent_tail_radius = 25
 R_spend_k = 0.01
 
 # Precursor

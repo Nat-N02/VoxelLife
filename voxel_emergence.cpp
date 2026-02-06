@@ -104,6 +104,10 @@ struct Params {
     float W_floor = 1e-4f; // little effect until large scales
     float W_decay = 0.0f; // 0.001 seems to expand? 0 inhibits development
 
+    float C_alpha = 0.1f;
+    float C_decay = 0.99f;
+    float k_conn = 0.3f;
+
     float repair_strength = 0.05f; // 0.025 inhibits, 0 shrink away to nothing, 0.1 rapid expand
     float repair_energy_cost = 0.05f; // 0 lowers damage and increases size, 0.1 adapts
     float repair_noise = 0.2f; // generally low effect
@@ -369,6 +373,7 @@ struct World {
     double baseline_FTP = 0;
     double baseline_Din = 0, baseline_Dout = 0, baseline_Gb = 0;
     uint64_t perturb_tick = 0;
+    std::vector<float> C;   // connection potential
 
     bool have_topR_prev = false;
     
@@ -462,6 +467,7 @@ struct World {
         repair_cost.assign(nvox, 0.0f);
         repair_elig.assign(nvox, 0.0f);
         R_boost.assign(nvox, 0.0f);
+        C.assign(nvox, 0.0f);
         E_residual.assign(nvox, 0.0f);
         top1_prev.resize(nvox, 0);
         top5_prev.resize(nvox, 0);
@@ -1063,6 +1069,7 @@ struct World {
 
         write_vec(os, repair_elig);
         write_vec(os, R_boost);
+        write_vec(os, C);
 
         // If you have E_residual as a persistent member, include it:
         // write_vec(os, E_residual);
@@ -1111,6 +1118,7 @@ struct World {
 
         read_vec(is, repair_elig);
         read_vec(is, R_boost);
+        read_vec(is, C);
 
         // If you saved E_residual, read it too:
         // read_vec(is, E_residual);
@@ -1152,15 +1160,11 @@ struct World {
         };
         must(repair_elig, "repair_elig");
         must(R_boost, "R_boost");
+        must(C, "C");
         if (have_prev_snapshot) must(D_prev, "D_prev");
 
-        // Rebuild derived tables that depend on seed/dims if needed:
-        // nbr/vh should already be correct for these dims,
-        // but if seed changed you probably want to rebuild vh.
-        // In your current setup seed is part of the checkpoint, so:
         build_neighbors_and_hashes();
 
-        // Ensure next and scratch arrays exist
         next.resize(nvox);
         sent.assign(nvox, 0.0f);
         sent_dir.assign(nvox*6, 0.0f);
@@ -1202,6 +1206,7 @@ struct World {
         std::fwrite(curr.D.data(), sizeof(float), nvox, f);
         std::fwrite(curr.P.data(), sizeof(float), nvox, f);
         std::fwrite(R_boost.data(), sizeof(float), nvox, f);
+        std::fwrite(C.data(), sizeof(float), nvox, f);
 
         std::fclose(f);
     }
@@ -1619,7 +1624,7 @@ struct World {
         }
         std::fill(sent.begin(), sent.end(), 0.0f);
 
-        if (tick == 10000301) start_freeze(1000);
+        if (tick == 100000301) start_freeze(1000);
         if (freeze_W && tick >= freeze_end)
             freeze_W = false;
 
@@ -1693,7 +1698,9 @@ struct World {
                 continue;
             }
 
-            float c = conductivity(curr.D[i]) * (1.0f + R_boost[i]);
+            float c = conductivity(curr.D[i]) *
+                (0.5f + R_boost[i]) *
+                (1.0f + p.k_conn * C[i]);
             float send = std::min(Ei * c, Ei);
 
             if (send <= 0.0f) {
@@ -1784,30 +1791,45 @@ struct World {
         }
     }
 
-    void compute_sent_local_max_radial(int r, std::vector<float>& out)
-    {
-        out.assign(nvox, 0.0f);
+    void compute_sent_local_max_box(int r, std::vector<float>& out_local_max) {
+        out_local_max.assign(nvox, 0.0f);
 
-        // Initialize with sent
-        for (size_t i = 0; i < nvox; i++)
-            out[i] = sent[i];
+        // Shortcut: if radius covers entire grid, local max == global max everywhere
+        int Rneed = std::max({p.nx-1, p.ny-1, p.nz-1});
+        if (r >= Rneed) {
+            float gmax = 0.0f;
+            for (size_t i=0; i<nvox; i++) gmax = std::max(gmax, sent[i]);
+            std::fill(out_local_max.begin(), out_local_max.end(), gmax);
+            return;
+        }
 
-        std::vector<float> tmp(nvox);
+        // Pass 1: X lines
+        for (int z=0; z<p.nz; z++) {
+            for (int y=0; y<p.ny; y++) {
+                const float* line = &sent[(z*p.ny + y)*p.nx];
+                float* out = &tmpX[(z*p.ny + y)*p.nx];
+                sliding_max_1d_padded(line, p.nx, r, out);
+            }
+        }
 
-        for (int step = 0; step < r; step++) {
-            tmp = out;
+        // Pass 2: Y lines
+        std::vector<float> inY(p.ny), outY(p.ny);
+        for (int z=0; z<p.nz; z++) {
+            for (int x=0; x<p.nx; x++) {
+                // gather line along y
+                for (int y=0; y<p.ny; y++) inY[y] = tmpX[idx(x,y,z)];
+                sliding_max_1d_padded(inY.data(), p.ny, r, outY.data());
+                for (int y=0; y<p.ny; y++) tmpY[idx(x,y,z)] = outY[y];
+            }
+        }
 
-            for (size_t i = 0; i < nvox; i++) {
-                float best = tmp[i];
-
-                for (int d = 0; d < 6; d++) {
-                    int j = nbr[i*6 + d];
-                    if (j >= 0) {
-                        best = std::max(best, tmp[j]);
-                    }
-                }
-
-                out[i] = best;
+        // Pass 3: Z lines
+        std::vector<float> inZ(p.nz), outZ(p.nz);
+        for (int y=0; y<p.ny; y++) {
+            for (int x=0; x<p.nx; x++) {
+                for (int z=0; z<p.nz; z++) inZ[z] = tmpY[idx(x,y,z)];
+                sliding_max_1d_padded(inZ.data(), p.nz, r, outZ.data());
+                for (int z=0; z<p.nz; z++) out_local_max[idx(x,y,z)] = outZ[z];
             }
         }
     }
@@ -1815,7 +1837,7 @@ struct World {
     void update_sent_tail() {
         static std::vector<float> local_max; // reuse
         int radius = p.sent_tail_radius;
-        compute_sent_local_max_radial(radius, local_max);
+        compute_sent_local_max_box(radius, local_max);
 
         for (size_t i=0; i<nvox; i++) {
             float lm = local_max[i];
@@ -1870,7 +1892,7 @@ struct World {
                 int xs, ys, zs;
                 symmetric_local_scramble(i, tick, 5, xs, ys, zs, p);
                 size_t j_scramble = idx(xs, ys, zs);
-                //float aj = sent[j_scramble];
+                // float aj = sent[j_scramble];
                 float aj = sent[(size_t)j];
                 max_aj = std::max(max_aj, aj);
                 if (aj > 0.0f) active_repairers++;
@@ -1942,6 +1964,8 @@ struct World {
                 repair_cost[(size_t)j] += cost;
                 E_residual[j] -= cost;
                 repair_events_tick++;
+                C[i] += p.C_alpha * (repair_delta[i]);
+                C[i] *= p.C_decay;
             };
 
             try_repair_from(j0);
@@ -1979,8 +2003,9 @@ struct World {
 
             float w[6];
             const float* cw = &curr.W[i*6];
+            float eff_decay = p.W_decay / (1 + 10 * C[i]);
             for (int d = 0; d < 6; d++) {
-                w[d] = lerpf(cw[d], 1.0f / 6.0f, p.W_decay);
+                w[d] = lerpf(cw[d], 1.0f / 6.0f, eff_decay);
             }
 
             for (int d = 0; d < 6; d++) {

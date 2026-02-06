@@ -514,7 +514,7 @@ if __name__ == "__main__":
         }
 
     visualize_time_slices(
-        start_idx=args.export[0] if args.export else 1,
+        start_idx=100001,
         step=args.step,
         export_args=export_cfg
     )
