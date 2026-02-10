@@ -136,9 +136,24 @@ struct Params {
 
     float source_inject = 0.05f;
 
+    float radius_grow = 0.02f;
+    float radius_shrink = 0.05f;
+    float radius_min = 1.0f;
+    float radius_max = 32.0f;
+
     float leak_k = 8.0f; 
     float repair_cost_activity_k = 1.0f;  
     float repair_cost_super_k = 20.0f;   
+
+    // --- Adaptive sent_tail radius (pressure–yield) ---
+    int sent_tail_rmin = 5;          // minimum effective influence radius
+    int sent_tail_rmax = 50;          // maximum effective influence radius
+    int resistance_look = 8;         // how far to sample ahead (in steps)
+    float radius_adapt_k = 1.2f;     // sigmoid sharpness
+    float radius_adapt_bias = -0.2f;  // shift decision boundary
+    float resistance_wD = 0.3f;      // weight on damage-ahead
+    float resistance_wR = 0.1f;      // weight on recent repairs-ahead
+    float pressure_w = 0.8f;         // weight on outgoing pressure
 
     // --- Precursor -> R_boost ---
     float P0 = 1.0f;            // baseline precursor level
@@ -338,6 +353,9 @@ struct Field {
     }
 };
 
+// Choose a small ladder of radii (log-ish spacing is best)
+static constexpr std::array<int, 7> R_LADDER = {5, 8, 12, 18, 26, 38, 50};
+
 // ============================================================
 // World
 // ============================================================
@@ -374,6 +392,7 @@ struct World {
     double baseline_Din = 0, baseline_Dout = 0, baseline_Gb = 0;
     uint64_t perturb_tick = 0;
     std::vector<float> C;   // connection potential
+    std::vector<float> sent_radius;   // per-voxel influence radius
 
     bool have_topR_prev = false;
     
@@ -392,7 +411,6 @@ struct World {
     bool freeze_W = false;
     uint64_t freeze_start = 0;
     uint64_t freeze_end = 0;
-
 
     // --- PID mobility tracking ---
     bool have_pid_pos_prev = false;
@@ -447,6 +465,7 @@ struct World {
     int routed_active_voxels_tick = 0;
     float sent_q95_cached = 0.0f;
     float sent_q99_cached = 0.0f;
+    std::vector<float> repair_delta_prev;  // last-tick repairs for adaptive radius
 
     // --- Temporal diagnostics ---
     std::vector<float> D_prev;
@@ -465,7 +484,9 @@ struct World {
         sent_dir.assign(nvox*6, 0.0f);
         repair_delta.assign(nvox, 0.0f);
         repair_cost.assign(nvox, 0.0f);
+        repair_delta_prev.assign(nvox, 0.0f);
         repair_elig.assign(nvox, 0.0f);
+        sent_radius.assign(nvox, float(p.sent_tail_radius));
         R_boost.assign(nvox, 0.0f);
         C.assign(nvox, 0.0f);
         E_residual.assign(nvox, 0.0f);
@@ -1118,7 +1139,7 @@ struct World {
 
         read_vec(is, repair_elig);
         read_vec(is, R_boost);
-        read_vec(is, C);
+        //read_vec(is, C);
 
         // If you saved E_residual, read it too:
         // read_vec(is, E_residual);
@@ -1160,7 +1181,7 @@ struct World {
         };
         must(repair_elig, "repair_elig");
         must(R_boost, "R_boost");
-        must(C, "C");
+        //must(C, "C");
         if (have_prev_snapshot) must(D_prev, "D_prev");
 
         build_neighbors_and_hashes();
@@ -1576,6 +1597,34 @@ struct World {
             curr.D[i] = 0.0f;
         }
     }
+    inline float directional_resistance(size_t i, int d) const {
+    // Sample ahead along direction d for p.resistance_look steps
+    // Resistance increases with damage ahead, decreases with recent repairs ahead.
+    float accD = 0.0f;
+    float accR = 0.0f;
+
+    int steps = std::max(1, p.resistance_look);
+    int cur = (int)i;
+
+    for (int s = 0; s < steps; s++) {
+        int j = nbr[cur*6 + d];
+        if (j < 0) break;
+        cur = j;
+
+        // "damage ahead" (absolute damage, not gradient) — simple and robust
+        accD += curr.D[(size_t)cur];
+
+        // subtract recent successful repair in that region (prev tick)
+        accR += repair_delta_prev[(size_t)cur];
+    }
+
+    // Normalize by steps taken (avoid bias near borders)
+    float denom = float(steps);
+    float Dn = accD / denom;
+    float Rn = accR / denom;
+
+    return p.resistance_wD * Dn - p.resistance_wR * Rn;
+}   
 
     // --------------------------------------------------------
     // One tick
@@ -1590,6 +1639,7 @@ struct World {
         flux_dirs_tick = 0;
         econ_dirs_tick = 0;
         success_dirs_tick = 0;
+        repair_delta_prev = repair_delta;
 
         // clear scratch
         std::fill(sent_dir.begin(), sent_dir.end(), 0.0f);
@@ -1835,33 +1885,82 @@ struct World {
     }
 
     void update_sent_tail() {
+        static std::vector<float> local_min; // reuse
         static std::vector<float> local_max; // reuse
-        int radius = p.sent_tail_radius;
-        compute_sent_local_max_box(radius, local_max);
 
-        for (size_t i=0; i<nvox; i++) {
-            float lm = local_max[i];
+        // Storage reused each tick
+        static std::vector<std::vector<float>> sent_local_max_ladder;
+        static bool initialized = false;
+
+        if (!initialized) {
+            sent_local_max_ladder.resize(R_LADDER.size());
+            for (auto& v : sent_local_max_ladder)
+                v.resize(nvox);
+            initialized = true;
+        }
+
+        int rmin = std::max(0, p.sent_tail_rmin);
+        int rmax = std::max(rmin, p.sent_tail_rmax);
+
+        for (size_t k = 0; k < R_LADDER.size(); k++) {
+            compute_sent_local_max_box(
+                R_LADDER[k],
+                sent_local_max_ladder[k]
+            );
+        }
+
+        for (size_t i = 0; i < nvox; i++) {
+
+            // ---- Pressure ----
+            float Pout = 0.0f;
+            for (int d = 0; d < 6; d++)
+                Pout += sent_dir[i*6 + d];
+            Pout *= p.pressure_w;
+
+            // ---- Resistance ----
+            float R = 0.0f;
+            for (int d = 0; d < 6; d++)
+                R += directional_resistance(i, d);
+            R /= 6.0f;
+
+            // ---- Adaptivity gate ----
+            float x = (Pout - R) + p.radius_adapt_bias;
+            float g = 1.0f / (1.0f + std::exp(-p.radius_adapt_k * x));
+
+            // ---- Effective radius ----
+            float r_eff = lerpf(
+                float(p.sent_tail_rmin),
+                float(p.sent_tail_rmax),
+                g
+            );
+
+            // ---- Pick nearest ladder radius ----
+            int best_k = 0;
+            float best_err = 1e30f;
+            for (size_t k = 0; k < R_LADDER.size(); k++) {
+                float err = std::fabs(float(R_LADDER[k]) - r_eff);
+                if (err < best_err) {
+                    best_err = err;
+                    best_k = int(k);
+                }
+            }
+
+            float lm = sent_local_max_ladder[best_k][i];
+
+            // ---- Tail update (unchanged) ----
             float& tail = sent_tail_local[i];
-
             if (lm > tail) {
-                tail = tail + p.sent_tail_rise * (lm - tail);
+                tail += p.sent_tail_rise * (lm - tail);
             } else {
                 tail *= p.sent_tail_decay;
             }
 
-            if (tail < 1e-6f) tail = 1e-6f;
+            if (tail < 1e-6f)
+                tail = 1e-6f;
         }
     }
 
-    // --------------------------------------------------------
-    // REPAIR (scarce):
-    // - Perpendicular neighbors only (geometry)
-    // - Uses neighbor activity sent[j], not neighbor energy
-    // - Neighbor must be below dead threshold (cannot repair if dead)
-    // - Activity must exceed threshold (no dribble)
-    // - Efficiency collapses with repairer damage
-    // - Cost is superlinear (quadratic in amount) + activity multiplier
-    // --------------------------------------------------------
+
     void apply_perpendicular_repair() {
         uint64_t active_repairers=0, eligible_repairers=0, eligible_active_repairers=0;
         if (tick <= 100010 && tick >= 100000) return;
@@ -1972,6 +2071,21 @@ struct World {
             try_repair_from(j1);
             try_repair_from(j2);
             try_repair_from(j3);
+            float repair_eff = 0.0f;
+            if (sent[i] > 1e-6f) {
+                repair_eff = repair_delta[i] / sent[i];
+            }
+            repair_eff = clampf(repair_eff, 0.0f, 1.0f);
+            float &R = sent_radius[i];
+
+            // If repair is productive, earn influence
+            if (repair_eff > 0.05f) {
+                R += p.radius_grow * repair_eff;
+            } else {
+                R -= p.radius_shrink;
+            }
+
+            R = clampf(R, p.radius_min, p.radius_max);
         }
 
         for (size_t i=0; i<nvox; i++) {
@@ -2235,6 +2349,26 @@ struct World {
 
         mean1 /= std::max<size_t>(1, c1);
         mean5 /= std::max<size_t>(1, c5);
+        float rmin_seen = 1e9f, rmax_seen = 0.0f, rmean = 0.0f;
+        for (size_t i = 0; i < nvox; i++) {
+            float r = lerpf(
+                float(p.sent_tail_rmin),
+                float(p.sent_tail_rmax),
+                1.0f / (1.0f + std::exp(-p.radius_adapt_k *
+                    ((sent[i] * p.pressure_w) - directional_resistance(i,0))))
+            );
+            rmin_seen = std::min(rmin_seen, r);
+            rmax_seen = std::max(rmax_seen, r);
+            rmean += r;
+        }
+        rmean /= nvox;
+
+        std::cout
+            << " r_eff[min/mean/max]="
+            << rmin_seen << "/"
+            << rmean << "/"
+            << rmax_seen;
+
 
         double BSI = compute_BSI(curr.D, D_q50, nbr, nvox);
         double mean_R = 0.0;
