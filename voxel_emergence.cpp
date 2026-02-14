@@ -23,6 +23,33 @@ static inline float lerpf(float a, float b, float t) {
     return a + (b - a) * t;
 }
 
+struct TickTimer {
+    using clock = std::chrono::steady_clock;
+
+    clock::time_point t0;
+    double accum_ms = 0.0;
+    uint64_t count = 0;
+
+    void start() {
+        t0 = clock::now();
+    }
+
+    void stop() {
+        auto t1 = clock::now();
+        accum_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+        count++;
+    }
+
+    double mean_ms() const {
+        return (count > 0) ? (accum_ms / double(count)) : 0.0;
+    }
+
+    void reset() {
+        accum_ms = 0.0;
+        count = 0;
+    }
+};
+
 // ============================================================
 // Directions (6-neighborhood)
 // ============================================================
@@ -809,6 +836,7 @@ struct World {
             probe_open = false;
         }
     }
+    TickTimer tick_timer;
     void log_probe_window() {
         if (!probe_open) open_probe();
         if (!probe_open) return;
@@ -1630,6 +1658,7 @@ struct World {
     // One tick
     // --------------------------------------------------------
     void step() {
+        tick_timer.start();
         // reset per-tick diagnostics
         repair_events_tick = 0;
         repair_eligible_tick = 0;
@@ -1728,6 +1757,7 @@ struct World {
         log_probe_window();
 
         tick++;
+        tick_timer.stop();
     }
 
     // --------------------------------------------------------
@@ -2733,6 +2763,13 @@ struct World {
                 sent_q95_cached
             );
             metrics_written = true;
+        }
+
+        if (tick_timer.count > 0) {
+            std::cout
+                << " tick_ms=" << std::fixed << std::setprecision(3)
+                << tick_timer.mean_ms();
+            tick_timer.reset();
         }
 
         D_prev = curr.D;     // vector copy, but only every print_every
