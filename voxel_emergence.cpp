@@ -1,3 +1,4 @@
+#include <omp.h>
 #include <numeric>
 #include <cstdint>
 #include <vector>
@@ -22,33 +23,6 @@ static inline float clampf(float x, float lo, float hi) {
 static inline float lerpf(float a, float b, float t) {
     return a + (b - a) * t;
 }
-
-struct TickTimer {
-    using clock = std::chrono::steady_clock;
-
-    clock::time_point t0;
-    double accum_ms = 0.0;
-    uint64_t count = 0;
-
-    void start() {
-        t0 = clock::now();
-    }
-
-    void stop() {
-        auto t1 = clock::now();
-        accum_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
-        count++;
-    }
-
-    double mean_ms() const {
-        return (count > 0) ? (accum_ms / double(count)) : 0.0;
-    }
-
-    void reset() {
-        accum_ms = 0.0;
-        count = 0;
-    }
-};
 
 // ============================================================
 // Directions (6-neighborhood)
@@ -94,6 +68,33 @@ static inline uint64_t hash_u64(uint64_t x) {
     x ^= x >> 33;
     return x;
 }
+
+struct TickTimer {
+    using clock = std::chrono::steady_clock;
+
+    clock::time_point t0;
+    double accum_ms = 0.0;
+    uint64_t count = 0;
+
+    void start() {
+        t0 = clock::now();
+    }
+
+    void stop() {
+        auto t1 = clock::now();
+        accum_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+        count++;
+    }
+
+    double mean_ms() const {
+        return (count > 0) ? (accum_ms / double(count)) : 0.0;
+    }
+
+    void reset() {
+        accum_ms = 0.0;
+        count = 0;
+    }
+};
 
 struct LagBuffer {
     std::vector<double> R;   // mean repair activity per tick
@@ -420,6 +421,7 @@ struct World {
     uint64_t perturb_tick = 0;
     std::vector<float> C;   // connection potential
     std::vector<float> sent_radius;   // per-voxel influence radius
+    TickTimer tick_timer;
 
     bool have_topR_prev = false;
     
@@ -548,6 +550,11 @@ struct World {
     inline int idx(int x, int y, int z) const {
         return (z * p.ny + y) * p.nx + x;
     }
+    static inline float fast_sigmoid(float x) {
+        // maps R -> (0,1), smooth, monotone
+        return 0.5f + 0.5f * (x / (1.0f + std::fabs(x)));
+    }
+
     void build_component_mask(int label, std::vector<uint8_t>& out) {
         out.assign(nvox, 0);
         if (label < 0) return;                 // <-- CRITICAL GUARD
@@ -836,7 +843,6 @@ struct World {
             probe_open = false;
         }
     }
-    TickTimer tick_timer;
     void log_probe_window() {
         if (!probe_open) open_probe();
         if (!probe_open) return;
@@ -1232,7 +1238,7 @@ struct World {
     void dump_fields() const {
         char fname[256];
         std::snprintf(fname, sizeof(fname),
-            "dump/dump_t%08llu.bin",
+            "dump2/dump_t%08llu.bin",
             (unsigned long long)tick
         );
 
@@ -1256,6 +1262,9 @@ struct World {
         std::fwrite(curr.P.data(), sizeof(float), nvox, f);
         std::fwrite(R_boost.data(), sizeof(float), nvox, f);
         std::fwrite(C.data(), sizeof(float), nvox, f);
+
+        // NEW: routing weights (6 per voxel)
+        std::fwrite(curr.W.data(), sizeof(float), nvox * 6, f);
 
         std::fclose(f);
     }
@@ -1557,12 +1566,12 @@ struct World {
 
     inline float conductivity(float D) const {
         float x = clampf(D / p.D_ref, 0.0f, 1.0f);
-        constexpr float x_crit = 0.6f;
-        float sharpness = p.D_to_conduct_drop;
-        float cliff = 1.0f / (1.0f + std::exp(sharpness * (x - x_crit)));
+        float t = p.D_to_conduct_drop * (x - 0.6f);
+        float cliff = fast_sigmoid(-t);   // sign matches logistic
         float floor = p.porous_conduct_floor;
         return floor + (1.0f - floor) * cliff;
     }
+
 
     inline bool is_source_voxel_idx(size_t i) const {
         int x = int(i % p.nx);
@@ -1827,47 +1836,33 @@ struct World {
         }
 
         const int w = 2*r + 1;
-        const int T = L + 2*r;          // padded length
+        const int T = L + 2*r;
         const float NEG_INF = -1e30f;
 
-        std::vector<int> dq;
-        dq.reserve(w);
+        // Fixed-size deque
+        int dq[256];                  // SAFE because r <= 50 in your ladder
+        int head = 0, tail = 0;       // [head, tail)
 
-        auto get = [&](int t)->float {
-            // padded index t maps to original index k=t-r
+        auto get = [&](int t) -> float {
             int k = t - r;
-            if (k < 0 || k >= L) return NEG_INF;
-            return in[k];
+            return (k < 0 || k >= L) ? NEG_INF : in[k];
         };
 
-        int head = 0; // index into dq (manual pop_front without O(n))
-
-        for (int t = 0; t < T; t++) {
+        for (int t = 0; t < T; ++t) {
             float v = get(t);
 
-            // pop_back while last value <= v
-            while ((int)dq.size() > head) {
-                int back_idx = dq.back();
-                if (get(back_idx) > v) break;
-                dq.pop_back();
-            }
-            dq.push_back(t);
+            while (tail > head && get(dq[tail - 1]) <= v)
+                --tail;
 
-            // pop_front if out of window [t-w+1, t]
+            dq[tail++] = t;
+
             int win_lo = t - w + 1;
-            while ((int)dq.size() > head && dq[head] < win_lo) head++;
+            while (dq[head] < win_lo)
+                ++head;
 
-            // output when window fully formed: corresponds to center i = t - 2r
             int i = t - 2*r;
-            if (i >= 0 && i < L) {
+            if ((unsigned)i < (unsigned)L)
                 out[i] = get(dq[head]);
-            }
-
-            // occasionally compact to avoid dq growing forever
-            if (head > 1024) {
-                dq.erase(dq.begin(), dq.begin() + head);
-                head = 0;
-            }
         }
     }
 
@@ -1884,6 +1879,7 @@ struct World {
         }
 
         // Pass 1: X lines
+        #pragma omp parallel for collapse(2) schedule(static)
         for (int z=0; z<p.nz; z++) {
             for (int y=0; y<p.ny; y++) {
                 const float* line = &sent[(z*p.ny + y)*p.nx];
@@ -1894,22 +1890,34 @@ struct World {
 
         // Pass 2: Y lines
         std::vector<float> inY(p.ny), outY(p.ny);
-        for (int z=0; z<p.nz; z++) {
-            for (int x=0; x<p.nx; x++) {
-                // gather line along y
-                for (int y=0; y<p.ny; y++) inY[y] = tmpX[idx(x,y,z)];
-                sliding_max_1d_padded(inY.data(), p.ny, r, outY.data());
-                for (int y=0; y<p.ny; y++) tmpY[idx(x,y,z)] = outY[y];
+        #pragma omp parallel for collapse(2) schedule(static)
+        for (int z = 0; z < p.nz; z++) {
+            for (int x = 0; x < p.nx; x++) {
+
+                // Thread-local scratch (stack allocated)
+                float inY[512];
+                float outY[512];
+
+                for (int y = 0; y < p.ny; y++)
+                    inY[y] = tmpX[idx(x,y,z)];
+
+                sliding_max_1d_padded(inY, p.ny, r, outY);
+
+                for (int y = 0; y < p.ny; y++)
+                    tmpY[idx(x,y,z)] = outY[y];
             }
         }
 
         // Pass 3: Z lines
         std::vector<float> inZ(p.nz), outZ(p.nz);
-        for (int y=0; y<p.ny; y++) {
-            for (int x=0; x<p.nx; x++) {
-                for (int z=0; z<p.nz; z++) inZ[z] = tmpY[idx(x,y,z)];
-                sliding_max_1d_padded(inZ.data(), p.nz, r, outZ.data());
-                for (int z=0; z<p.nz; z++) out_local_max[idx(x,y,z)] = outZ[z];
+        // Z pass: nz is tiny, do direct max
+        for (int y = 0; y < p.ny; y++) {
+            for (int x = 0; x < p.nx; x++) {
+                float m = -1e30f;
+                for (int z = 0; z < p.nz; z++)
+                    m = std::max(m, tmpY[idx(x,y,z)]);
+                for (int z = 0; z < p.nz; z++)
+                    out_local_max[idx(x,y,z)] = m;
             }
         }
     }
@@ -1955,7 +1963,7 @@ struct World {
 
             // ---- Adaptivity gate ----
             float x = (Pout - R) + p.radius_adapt_bias;
-            float g = 1.0f / (1.0f + std::exp(-p.radius_adapt_k * x));
+            float g = fast_sigmoid(p.radius_adapt_k * x);
 
             // ---- Effective radius ----
             float r_eff = lerpf(
@@ -2049,7 +2057,7 @@ struct World {
                 float a = sent[i] / (curr.E[i] + 1e-6f);
 
                 // center at threshold, smoothness controlled by slope
-                float activity_gate = 1.0f / (1.0f + std::exp(-p.act_k * (a - p.act_thresh)));
+                float activity_gate = fast_sigmoid(p.act_k * (a - p.act_thresh));
                 float P_available = curr.P[i];   // kinetics
                 float dR = p.k_PR * P_available * activity_gate
                         / (1.0f + R / p.R_sat);
@@ -2076,8 +2084,7 @@ struct World {
 
                 // --- surface-area penalty ---
                 float gD = local_D_gradient(i);
-                float surf = 1.0f + p.repair_surface_k *
-                    std::pow(gD, p.repair_surface_power);
+                float surf = 1.0f + p.repair_surface_k * gD;
 
                 cost *= surf;
 
@@ -2764,7 +2771,6 @@ struct World {
             );
             metrics_written = true;
         }
-
         if (tick_timer.count > 0) {
             std::cout
                 << " tick_ms=" << std::fixed << std::setprecision(3)
@@ -2783,7 +2789,15 @@ struct World {
 // Main
 // ============================================================
 int main(int argc, char** argv) {
-    
+    omp_set_dynamic(0);
+    omp_set_num_threads(8);
+
+    #pragma omp parallel
+    {
+        int tid = omp_get_thread_num();
+        int n   = omp_get_num_threads();
+        printf("hello from thread %d / %d\n", tid, n);
+    }
     Params p;
 
     int steps = 150000002;
